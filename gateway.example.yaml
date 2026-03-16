@@ -1,0 +1,54 @@
+# aistatus gateway — local transparent proxy for AI API failover
+#
+# Copy to: ~/.aistatus/gateway.yaml
+# Start:   python -m aistatus.gateway start
+#
+# Or skip config entirely with auto-discovery:
+#   python -m aistatus.gateway start --auto
+
+port: 9880
+
+# ── Anthropic (for Claude Code) ─────────────────────────────────
+# Claude Code sets ANTHROPIC_BASE_URL=http://localhost:9880/anthropic
+anthropic:
+  # Multiple keys for automatic rotation (optional)
+  # If omitted, forwards the incoming API key as-is (passthrough)
+  keys:
+    - $ANTHROPIC_API_KEY
+    # - sk-ant-your-backup-key
+
+  fallbacks:
+    # OpenRouter serves Claude models via OpenAI-compatible API.
+    # Gateway automatically translates Anthropic ↔ OpenAI format.
+    - name: openrouter
+      base_url: https://openrouter.ai/api/v1
+      key: $OPENROUTER_API_KEY
+      model_prefix: "anthropic/"
+      translate: anthropic-to-openai
+
+# ── OpenAI (for Codex) ──────────────────────────────────────────
+# Codex sets OPENAI_BASE_URL=http://localhost:9880/openai/v1
+openai:
+  keys:
+    - $OPENAI_API_KEY
+
+  fallbacks:
+    - name: openrouter
+      base_url: https://openrouter.ai/api/v1
+      key: $OPENROUTER_API_KEY
+      model_prefix: "openai/"
+
+    # Use DeepSeek as budget fallback with model mapping
+    # - name: deepseek
+    #   base_url: https://api.deepseek.com
+    #   key: $DEEPSEEK_API_KEY
+    #   model_map:
+    #     gpt-4o: deepseek-chat
+    #     gpt-4o-mini: deepseek-chat
+
+# ── Google (for Gemini CLI) ─────────────────────────────────────
+# Multi-key rotation only (no cross-provider fallback)
+# google:
+#   keys:
+#     - $GEMINI_API_KEY
+#     - $GEMINI_API_KEY_2
