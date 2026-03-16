@@ -1,0 +1,440 @@
+"""Gateway HTTP server — transparent proxy with failover and key rotation."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from typing import Any
+
+import aiohttp
+from aiohttp import web
+
+from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
+from .health import HealthTracker
+
+logger = logging.getLogger("aistatus.gateway")
+
+
+class GatewayServer:
+    def __init__(self, config: GatewayConfig):
+        self.config = config
+        self.health = HealthTracker()
+        self._session: aiohttp.ClientSession | None = None
+        self._key_idx: dict[str, int] = {}  # round-robin counters
+
+    async def run(self):
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=300, connect=10),
+            connector=aiohttp.TCPConnector(limit=100),
+        )
+
+        app = web.Application()
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/status", self._handle_status)
+        # Catch-all proxy: /{endpoint}/...
+        app.router.add_route("*", "/{endpoint}/{path:.*}", self._handle_proxy)
+
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, self.config.host, self.config.port)
+        await site.start()
+
+        self._print_banner()
+
+        try:
+            import asyncio
+            await asyncio.Event().wait()  # run forever
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
+            if self._session:
+                await self._session.close()
+            await runner.cleanup()
+
+    # ------------------------------------------------------------------
+    # Proxy handler
+    # ------------------------------------------------------------------
+
+    async def _handle_proxy(self, request: web.Request) -> web.StreamResponse:
+        ep_name = request.match_info["endpoint"]
+        path = request.match_info["path"]
+
+        endpoint = self.config.endpoints.get(ep_name)
+        if not endpoint:
+            return web.json_response(
+                {"error": {"message": f"Unknown endpoint: {ep_name}", "type": "gateway_error"}},
+                status=404,
+            )
+
+        body = await request.read()
+        backends = self._build_backend_list(endpoint, request)
+
+        if not backends:
+            return web.json_response(
+                {"error": {"message": "All backends unavailable", "type": "gateway_error"}},
+                status=503,
+            )
+
+        last_err: _ProxyError | None = None
+        for backend in backends:
+            try:
+                return await self._forward(request, backend, path, body)
+            except _ProxyError as e:
+                last_err = e
+                self.health.record_error(backend["id"], e.status)
+                logger.warning(
+                    "%s → %d, trying next backend", backend["id"], e.status
+                )
+
+        # All failed — return last error
+        if last_err:
+            return web.Response(body=last_err.body, status=last_err.status,
+                                content_type="application/json")
+        return web.json_response(
+            {"error": {"message": "All backends failed", "type": "gateway_error"}},
+            status=503,
+        )
+
+    # ------------------------------------------------------------------
+    # Backend selection
+    # ------------------------------------------------------------------
+
+    def _build_backend_list(
+        self, endpoint: EndpointConfig, request: web.Request
+    ) -> list[dict[str, Any]]:
+        """Build ordered list of backends to try."""
+        backends: list[dict[str, Any]] = []
+        ep = endpoint.name
+
+        if endpoint.keys:
+            # Key rotation mode
+            idx = self._key_idx.get(ep, 0)
+            n = len(endpoint.keys)
+            for i in range(n):
+                ki = (idx + i) % n
+                bid = f"{ep}:key:{ki}"
+                if self.health.is_healthy(bid):
+                    backends.append(self._primary_backend(bid, endpoint, endpoint.keys[ki]))
+            self._key_idx[ep] = (idx + 1) % n
+        else:
+            # Passthrough mode — forward the incoming auth header
+            bid = f"{ep}:passthrough"
+            if self.health.is_healthy(bid):
+                incoming_key = self._extract_incoming_key(request, endpoint.auth_style)
+                backends.append(self._primary_backend(bid, endpoint, incoming_key))
+
+        # Fallbacks
+        for fb in endpoint.fallbacks:
+            bid = f"{ep}:fb:{fb.name}"
+            if not self.health.is_healthy(bid) or not fb.api_key:
+                continue
+            backends.append({
+                "id": bid,
+                "base_url": fb.base_url,
+                "api_key": fb.api_key,
+                "auth_style": fb.auth_style,
+                "model_prefix": fb.model_prefix,
+                "model_map": fb.model_map,
+                "translate": fb.translate,
+            })
+
+        return backends
+
+    @staticmethod
+    def _primary_backend(
+        bid: str, endpoint: EndpointConfig, api_key: str
+    ) -> dict[str, Any]:
+        return {
+            "id": bid,
+            "base_url": endpoint.base_url,
+            "api_key": api_key,
+            "auth_style": endpoint.auth_style,
+            "model_prefix": "",
+            "model_map": {},
+            "translate": None,
+        }
+
+    @staticmethod
+    def _extract_incoming_key(request: web.Request, auth_style: str) -> str:
+        if auth_style == "anthropic":
+            return request.headers.get("x-api-key", "")
+        if auth_style == "google":
+            return request.headers.get("x-goog-api-key", "")
+        # bearer
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth[7:]
+        return auth
+
+    # ------------------------------------------------------------------
+    # Forward to upstream
+    # ------------------------------------------------------------------
+
+    async def _forward(
+        self,
+        request: web.Request,
+        backend: dict[str, Any],
+        path: str,
+        body: bytes,
+    ) -> web.StreamResponse:
+        assert self._session is not None
+
+        needs_translate = backend["translate"] == "anthropic-to-openai"
+
+        # Determine original model for response translation
+        original_model = ""
+        if needs_translate and body:
+            try:
+                original_model = json.loads(body).get("model", "")
+            except Exception:
+                pass
+
+        # --- build target URL ---
+        effective_path = path
+        if needs_translate and "v1/messages" in path:
+            effective_path = "v1/chat/completions"
+
+        base = backend["base_url"].rstrip("/")
+        url = f"{base}/{effective_path}"
+        if request.query_string:
+            url += f"?{request.query_string}"
+
+        # --- headers ---
+        headers = self._build_upstream_headers(request, backend)
+
+        # --- body ---
+        upstream_body = body
+        if needs_translate and body:
+            from .translate import anthropic_request_to_openai
+            upstream_body = anthropic_request_to_openai(body)
+
+        # Apply model mapping / prefix
+        if body and (backend["model_map"] or backend["model_prefix"]):
+            upstream_body = self._map_model(upstream_body, backend)
+
+        # --- send request ---
+        t0 = time.monotonic()
+        try:
+            resp = await self._session.request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                data=upstream_body,
+                allow_redirects=False,
+            )
+        except aiohttp.ClientError as e:
+            raise _ProxyError(502, json.dumps(
+                {"error": {"message": f"Upstream connection error: {e}", "type": "gateway_error"}}
+            ).encode())
+
+        elapsed_ms = round((time.monotonic() - t0) * 1000)
+
+        # Check retryable status
+        if resp.status in (429, 500, 502, 503, 529):
+            err_body = await resp.read()
+            resp.release()
+            raise _ProxyError(resp.status, err_body)
+
+        self.health.record_success(backend["id"])
+
+        content_type = resp.headers.get("content-type", "")
+        is_streaming = "text/event-stream" in content_type
+
+        if is_streaming:
+            return await self._stream(request, resp, backend, original_model)
+        else:
+            return await self._respond(resp, backend, original_model, elapsed_ms)
+
+    async def _respond(
+        self,
+        upstream: aiohttp.ClientResponse,
+        backend: dict[str, Any],
+        original_model: str,
+        elapsed_ms: int,
+    ) -> web.Response:
+        """Non-streaming response."""
+        resp_body = await upstream.read()
+        upstream.release()
+
+        if backend["translate"] == "anthropic-to-openai":
+            from .translate import openai_response_to_anthropic
+            resp_body = openai_response_to_anthropic(resp_body, original_model)
+            content_type = "application/json"
+        else:
+            content_type = upstream.headers.get("content-type", "application/json")
+
+        response = web.Response(body=resp_body, status=upstream.status, content_type=content_type)
+
+        # Forward selected headers
+        for h in ("x-request-id", "openai-organization", "anthropic-ratelimit-requests-remaining"):
+            if h in upstream.headers:
+                response.headers[h] = upstream.headers[h]
+        response.headers["x-gateway-backend"] = backend["id"]
+        response.headers["x-gateway-ms"] = str(elapsed_ms)
+        return response
+
+    async def _stream(
+        self,
+        request: web.Request,
+        upstream: aiohttp.ClientResponse,
+        backend: dict[str, Any],
+        original_model: str,
+    ) -> web.StreamResponse:
+        """Streaming (SSE) response."""
+        needs_translate = backend["translate"] == "anthropic-to-openai"
+
+        if needs_translate:
+            # OpenAI SSE → Anthropic SSE
+            resp = web.StreamResponse()
+            resp.content_type = "text/event-stream"
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Connection"] = "keep-alive"
+            resp.headers["x-gateway-backend"] = backend["id"]
+            await resp.prepare(request)
+
+            from .translate import openai_sse_to_anthropic_sse
+
+            async def _chunks():
+                async for chunk in upstream.content.iter_any():
+                    yield chunk
+
+            async for translated in openai_sse_to_anthropic_sse(_chunks(), original_model):
+                await resp.write(translated)
+
+            upstream.release()
+            return resp
+        else:
+            # Direct SSE passthrough
+            resp = web.StreamResponse()
+            resp.content_type = "text/event-stream"
+            resp.headers["Cache-Control"] = "no-cache"
+            resp.headers["Connection"] = "keep-alive"
+            resp.headers["x-gateway-backend"] = backend["id"]
+            for h in ("x-request-id", "openai-organization"):
+                if h in upstream.headers:
+                    resp.headers[h] = upstream.headers[h]
+            await resp.prepare(request)
+
+            async for chunk in upstream.content.iter_any():
+                await resp.write(chunk)
+
+            upstream.release()
+            return resp
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_upstream_headers(
+        request: web.Request, backend: dict[str, Any]
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+
+        # Copy safe headers from original request
+        skip = {
+            "host", "authorization", "x-api-key", "x-goog-api-key",
+            "content-length", "transfer-encoding", "connection",
+        }
+        for k, v in request.headers.items():
+            if k.lower() not in skip:
+                headers[k] = v
+
+        # Set upstream auth
+        style = AUTH_STYLES.get(backend["auth_style"], AUTH_STYLES["bearer"])
+        header_name, prefix = style
+        headers[header_name] = prefix + backend["api_key"]
+
+        return headers
+
+    @staticmethod
+    def _map_model(body: bytes, backend: dict[str, Any]) -> bytes:
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return body
+
+        model = data.get("model")
+        if not model:
+            return body
+
+        # Exact mapping takes priority
+        if model in backend["model_map"]:
+            data["model"] = backend["model_map"][model]
+        elif backend["model_prefix"]:
+            data["model"] = backend["model_prefix"] + model
+
+        return json.dumps(data).encode()
+
+    # ------------------------------------------------------------------
+    # Info endpoints
+    # ------------------------------------------------------------------
+
+    async def _handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "ok",
+            "endpoints": list(self.config.endpoints.keys()),
+        })
+
+    async def _handle_status(self, request: web.Request) -> web.Response:
+        info: dict[str, Any] = {}
+        for ep_name, ep in self.config.endpoints.items():
+            ep_info: dict[str, Any] = {"backends": []}
+            for i in range(len(ep.keys)):
+                bid = f"{ep_name}:key:{i}"
+                ep_info["backends"].append({
+                    "id": bid, "type": "primary", "healthy": self.health.is_healthy(bid),
+                })
+            if not ep.keys:
+                bid = f"{ep_name}:passthrough"
+                ep_info["backends"].append({
+                    "id": bid, "type": "passthrough", "healthy": self.health.is_healthy(bid),
+                })
+            for fb in ep.fallbacks:
+                bid = f"{ep_name}:fb:{fb.name}"
+                ep_info["backends"].append({
+                    "id": bid, "type": "fallback", "name": fb.name,
+                    "healthy": self.health.is_healthy(bid),
+                })
+            info[ep_name] = ep_info
+
+        return web.json_response({
+            "endpoints": info,
+            "health_detail": self.health.summary(),
+        })
+
+    # ------------------------------------------------------------------
+    # Banner
+    # ------------------------------------------------------------------
+
+    def _print_banner(self):
+        base = f"http://{self.config.host}:{self.config.port}"
+        print()
+        print(f"  aistatus gateway running on {base}")
+        print()
+        for ep_name, ep in self.config.endpoints.items():
+            nk = len(ep.keys)
+            nf = len(ep.fallbacks)
+            key_info = f"{nk} key{'s' if nk != 1 else ''}" if nk else "passthrough"
+            fb_names = ", ".join(f.name for f in ep.fallbacks)
+            fb_info = f" → fallback: {fb_names}" if fb_names else ""
+            print(f"  /{ep_name}/*  ({key_info}{fb_info})")
+        print()
+        print("  Configure your CLI tools:")
+        if "anthropic" in self.config.endpoints:
+            print(f"    export ANTHROPIC_BASE_URL={base}/anthropic")
+        if "openai" in self.config.endpoints:
+            print(f"    export OPENAI_BASE_URL={base}/openai/v1")
+        print()
+        print(f"  Status:  {base}/status")
+        print(f"  Health:  {base}/health")
+        print()
+
+
+class _ProxyError(Exception):
+    """Retryable upstream error."""
+
+    def __init__(self, status: int, body: bytes):
+        self.status = status
+        self.body = body

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aistatus"
+version = "0.0.1"
+description = "Smart AI model routing with real-time status awareness. Pre-flight checks, auto-fallback, budget constraints."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "LeTau Robotics", email = "hello@aistatus.cc" }]
+keywords = ["ai", "llm", "routing", "fallback", "agent", "openai", "anthropic", "gemini"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+google = ["google-genai>=1.0"]
+gateway = ["aiohttp>=3.9", "pyyaml>=6.0"]
+all = ["anthropic>=0.40", "openai>=1.50", "google-genai>=1.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.8"]
+
+[project.urls]
+Homepage = "https://aistatus.cc"
+Documentation = "https://aistatus.cc/docs"
+Repository = "https://github.com/fangxm233/aistatus-python"
+
+[tool.setuptools.packages.find]
+include = ["aistatus*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
