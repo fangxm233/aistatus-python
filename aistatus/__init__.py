@@ -18,7 +18,7 @@ Tier-based routing (requires configuration)::
     resp = router.route("Hello!", tier="fast")
 """
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # Core routing
 from .router import Router  # noqa: F401
