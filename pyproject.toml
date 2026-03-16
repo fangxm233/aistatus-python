@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aistatus"
 version = "0.0.1"
-description = "Smart AI model routing with real-time status awareness. Pre-flight checks, auto-fallback, budget constraints."
+description = "Status-aware LLM routing with pre-flight checks and auto-fallback for more reliable agents and coding CLIs."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "LeTau Robotics", email = "hello@aistatus.cc" }]
-keywords = ["ai", "llm", "routing", "fallback", "agent", "openai", "anthropic", "gemini"]
+keywords = ["ai", "llm", "routing", "fallback", "agent", "coding-cli", "reliability", "openai", "anthropic", "gemini"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
