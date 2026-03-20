@@ -12,6 +12,7 @@ from aiohttp import web
 
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
+from ..usage import UsageTracker
 
 logger = logging.getLogger("aistatus.gateway")
 
@@ -20,6 +21,7 @@ class GatewayServer:
     def __init__(self, config: GatewayConfig):
         self.config = config
         self.health = HealthTracker()
+        self.usage = UsageTracker()
         self._session: aiohttp.ClientSession | None = None
         self._key_idx: dict[str, int] = {}  # round-robin counters
 
@@ -266,6 +268,13 @@ class GatewayServer:
 
         response = web.Response(body=resp_body, status=upstream.status, content_type=content_type)
 
+        self._record_usage_if_possible(
+            backend=backend,
+            response_body=resp_body,
+            original_model=original_model,
+            elapsed_ms=elapsed_ms,
+        )
+
         # Forward selected headers
         for h in ("x-request-id", "openai-organization", "anthropic-ratelimit-requests-remaining"):
             if h in upstream.headers:
@@ -366,6 +375,63 @@ class GatewayServer:
             data["model"] = backend["model_prefix"] + model
 
         return json.dumps(data).encode()
+
+    def _record_usage_if_possible(
+        self,
+        *,
+        backend: dict[str, Any],
+        response_body: bytes,
+        original_model: str,
+        elapsed_ms: int,
+    ) -> None:
+        try:
+            payload = json.loads(response_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+
+        model = original_model or payload.get("model") or ""
+        usage = payload.get("usage") or {}
+
+        input_tokens = self._as_int(
+            usage.get("input_tokens", usage.get("prompt_tokens", 0))
+        )
+        output_tokens = self._as_int(
+            usage.get("output_tokens", usage.get("completion_tokens", 0))
+        )
+        if not model and not input_tokens and not output_tokens:
+            return
+
+        provider = self._infer_provider_from_backend(backend, model)
+        self.usage.record_usage(
+            provider=provider,
+            model=model or f"{provider}/unknown",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=elapsed_ms,
+            fallback=":fb:" in backend["id"],
+        )
+
+    @staticmethod
+    def _infer_provider_from_backend(backend: dict[str, Any], model: str) -> str:
+        if "/" in model:
+            return model.split("/", 1)[0]
+        backend_id = backend.get("id", "")
+        if backend_id.startswith("anthropic"):
+            return "anthropic"
+        if backend_id.startswith("openai"):
+            return "openai"
+        if backend_id.startswith("google"):
+            return "google"
+        if backend_id.startswith("openrouter"):
+            return "openrouter"
+        return backend_id.split(":", 1)[0] or "unknown"
+
+    @staticmethod
+    def _as_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
     # ------------------------------------------------------------------
     # Info endpoints
