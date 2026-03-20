@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 from .api import StatusAPI
@@ -18,6 +19,7 @@ from .models import (
     Status,
 )
 from .providers.base import ProviderAdapter, create_adapter
+from .usage import UsageTracker
 
 log = logging.getLogger("aistatus")
 
@@ -52,6 +54,7 @@ class Router:
         check_timeout: float = 3.0,
         providers: list[str] | None = None,
         auto_discover: bool = True,
+        track_usage: bool = True,
     ):
         """
         Args:
@@ -63,6 +66,7 @@ class Router:
         self.api = StatusAPI(base_url=base_url, timeout=check_timeout)
         self.adapters: dict[str, ProviderAdapter] = {}
         self._tiers: dict[str, list[str]] = {}
+        self.usage = UsageTracker() if track_usage else None
 
         if auto_discover:
             self._auto_discover(only=providers)
@@ -289,12 +293,20 @@ class Router:
         for slug, model_id in candidates:
             adapter = self.adapters[slug]
             try:
+                started = time.monotonic()
                 resp = adapter.call(model_id, messages, timeout, **kwargs)
+                latency_ms = round((time.monotonic() - started) * 1000)
                 is_fallback = (slug, model_id) != first
                 used = resp.model_used
                 if "/" not in used:
                     used = f"{slug}/{used}"
-                return RouteResponse(
+                cost_usd = self.usage.cost_calculator.calculate_cost(
+                    provider=slug,
+                    model=used,
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                ) if self.usage is not None else resp.cost_usd
+                routed = RouteResponse(
                     content=resp.content,
                     model_used=used,
                     provider_used=slug,
@@ -302,8 +314,12 @@ class Router:
                     fallback_reason=f"{first[0]} unavailable" if is_fallback else None,
                     input_tokens=resp.input_tokens,
                     output_tokens=resp.output_tokens,
+                    cost_usd=cost_usd,
                     raw=resp.raw,
                 )
+                if self.usage is not None:
+                    self.usage.record(routed, latency_ms)
+                return routed
             except Exception as e:
                 log.warning("Call to %s/%s failed: %s", slug, model_id, e)
                 tried.append(f"{slug}[error]")
@@ -328,12 +344,20 @@ class Router:
         for slug, model_id in candidates:
             adapter = self.adapters[slug]
             try:
+                started = time.monotonic()
                 resp = await adapter.acall(model_id, messages, timeout, **kwargs)
+                latency_ms = round((time.monotonic() - started) * 1000)
                 is_fallback = (slug, model_id) != first
                 used = resp.model_used
                 if "/" not in used:
                     used = f"{slug}/{used}"
-                return RouteResponse(
+                cost_usd = self.usage.cost_calculator.calculate_cost(
+                    provider=slug,
+                    model=used,
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                ) if self.usage is not None else resp.cost_usd
+                routed = RouteResponse(
                     content=resp.content,
                     model_used=used,
                     provider_used=slug,
@@ -341,8 +365,12 @@ class Router:
                     fallback_reason=f"{first[0]} unavailable" if is_fallback else None,
                     input_tokens=resp.input_tokens,
                     output_tokens=resp.output_tokens,
+                    cost_usd=cost_usd,
                     raw=resp.raw,
                 )
+                if self.usage is not None:
+                    self.usage.record(routed, latency_ms)
+                return routed
             except Exception as e:
                 log.warning("Call to %s/%s failed: %s", slug, model_id, e)
                 tried.append(f"{slug}[error]")
