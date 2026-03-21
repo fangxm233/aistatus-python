@@ -518,6 +518,33 @@ class GatewayServer:
             "model_health": model_health,
         })
 
+    async def _handle_usage(self, request: web.Request) -> web.Response:
+        period = request.query.get("period", "today")
+        group_by = request.query.get("group_by", "")
+
+        valid_periods = ("today", "week", "month", "all")
+        if period not in valid_periods:
+            return web.json_response(
+                {"error": {"message": f"Invalid period: {period}. Must be one of {valid_periods}", "type": "gateway_error"}},
+                status=400,
+            )
+
+        valid_groups = ("", "model", "provider")
+        if group_by not in valid_groups:
+            return web.json_response(
+                {"error": {"message": f"Invalid group_by: {group_by}. Must be one of {valid_groups[1:]}", "type": "gateway_error"}},
+                status=400,
+            )
+
+        result: dict[str, Any] = {"summary": self.usage.summary(period=period)}
+
+        if group_by == "model":
+            result["models"] = self.usage.by_model(period=period)
+        elif group_by == "provider":
+            result["providers"] = self.usage.by_provider(period=period)
+
+        return web.json_response(result)
+
     # ------------------------------------------------------------------
     # Signal handling
     # ------------------------------------------------------------------
@@ -588,6 +615,7 @@ class GatewayServer:
         print()
         print(f"  Status:  {base}/status")
         print(f"  Health:  {base}/health")
+        print(f"  Usage:   {base}/usage?period=today&group_by=model")
         print()
 
 
