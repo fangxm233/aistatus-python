@@ -20,7 +20,11 @@ anthropic:
   # Hybrid mode (default: true): when keys are set, the caller's
   # own API key is also tried after managed keys, before fallbacks.
   # Set to false to use only managed keys.
-  # passthrough: true
+  # Automatic model-level degradation order.
+  # model_fallbacks:
+  #   claude-opus-4-6:
+  #     - claude-sonnet-4-6
+  #     - claude-haiku-4-5
 
   fallbacks:
     # OpenRouter serves Claude models via OpenAI-compatible API.

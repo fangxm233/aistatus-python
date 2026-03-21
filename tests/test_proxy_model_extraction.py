@@ -1,3 +1,7 @@
+# input: mocked proxy requests, upstream responses, and endpoint fallback config
+# output: regression coverage for model extraction, health recording, and fallback headers
+# pos: gateway per-model proxy behavior test suite
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Tests for model extraction from request body in proxy handler.
 
 Verifies that the proxy handler extracts the model field from JSON request
@@ -112,6 +116,68 @@ class TestModelHealthOnSuccess:
             # _forward should have been called with model param
             call_args = mock_forward.call_args
             assert call_args[0][4] == "claude-opus-4-6"  # model param (positional)
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_model_uses_configured_fallback(self):
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="bearer",
+            keys=["sk-managed"],
+            model_fallbacks={"claude-opus-4-6": ["claude-sonnet-4-6", "claude-haiku-4-5"]},
+        )
+        server = _make_server(ep)
+        for _ in range(5):
+            server.health.record_error("anthropic:key:0", 529, model="claude-opus-4-6")
+
+        body = json.dumps({"model": "claude-opus-4-6", "max_tokens": 100}).encode()
+        request = _make_request(body=body, endpoint="anthropic")
+
+        mock_response = MagicMock()
+        with patch.object(server, "_forward", new_callable=AsyncMock) as mock_forward:
+            mock_forward.return_value = mock_response
+            await server._handle_proxy(request)
+
+        call_args = mock_forward.call_args
+        assert call_args[0][4] == "claude-sonnet-4-6"
+        forwarded_body = call_args[0][3]
+        assert json.loads(forwarded_body)["model"] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_respond_sets_model_fallback_header(self):
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="bearer",
+            keys=["sk-managed"],
+        )
+        server = _make_server(ep)
+
+        upstream = AsyncMock()
+        upstream.read = AsyncMock(return_value=b'{"content": "hello", "usage": {}}')
+        upstream.release = MagicMock()
+        upstream.status = 200
+        upstream.headers = {"content-type": "application/json"}
+
+        backend = {
+            "id": "anthropic:key:0",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-test",
+            "auth_style": "bearer",
+            "model_prefix": "",
+            "model_map": {},
+            "translate": None,
+        }
+
+        response = await server._respond(
+            upstream,
+            backend,
+            "claude-opus-4-6",
+            123,
+            fallback_header="claude-opus-4-6->claude-sonnet-4-6",
+        )
+
+        assert response.headers["x-gateway-model-fallback"] == "claude-opus-4-6->claude-sonnet-4-6"
 
     @pytest.mark.asyncio
     async def test_forward_records_model_success(self):

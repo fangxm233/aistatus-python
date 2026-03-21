@@ -1,3 +1,7 @@
+# input: gateway endpoint configs, mocked requests, and health state
+# output: regression coverage for backend ordering, config parsing, and status data
+# pos: gateway backend selection and config-loading test suite
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Tests for hybrid backend selection in the gateway.
 
 Verifies that _build_backend_list produces correct backend lists for:
@@ -416,6 +420,49 @@ class TestConfigLoading:
         config = GatewayConfig._from_dict(raw)
         assert config.endpoints["openai"].passthrough is True
 
+    def test_from_dict_parses_model_fallbacks(self):
+        raw = {
+            "anthropic": {
+                "keys": ["sk-test"],
+                "model_fallbacks": {
+                    "claude-opus-4-6": ["claude-sonnet-4-6", "claude-haiku-4-5"],
+                },
+            },
+        }
+        config = GatewayConfig._from_dict(raw)
+        assert config.endpoints["anthropic"].model_fallbacks == {
+            "claude-opus-4-6": ["claude-sonnet-4-6", "claude-haiku-4-5"],
+        }
+
+    def test_from_dict_model_fallbacks_default_empty(self):
+        raw = {
+            "anthropic": {
+                "keys": ["sk-test"],
+            },
+        }
+        config = GatewayConfig._from_dict(raw)
+        assert config.endpoints["anthropic"].model_fallbacks == {}
+
+    @pytest.mark.parametrize(
+        ("value", "message"),
+        [
+            (["claude-opus-4-6"], "model_fallbacks must be a mapping"),
+            ({"claude-opus-4-6": "claude-sonnet-4-6"}, "fallback list must be a non-empty list"),
+            ({"claude-opus-4-6": []}, "fallback list must be a non-empty list"),
+            ({"claude-opus-4-6": [""]}, "fallback target must be a non-empty string"),
+            ({"": ["claude-sonnet-4-6"]}, "source model must be a non-empty string"),
+        ],
+    )
+    def test_from_dict_rejects_invalid_model_fallbacks(self, value, message):
+        raw = {
+            "anthropic": {
+                "keys": ["sk-test"],
+                "model_fallbacks": value,
+            },
+        }
+        with pytest.raises(ValueError, match=message):
+            GatewayConfig._from_dict(raw)
+
     def test_auto_discover_sets_passthrough_true(self):
         """Auto-discovered endpoints should have passthrough=True by default."""
         import os
@@ -430,6 +477,7 @@ class TestConfigLoading:
                 os.environ["OPENAI_API_KEY"] = old
             elif "OPENAI_API_KEY" in os.environ:
                 del os.environ["OPENAI_API_KEY"]
+
 
 
 # -----------------------------------------------------------------------
