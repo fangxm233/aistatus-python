@@ -1,6 +1,6 @@
-# input: aiohttp requests, gateway config, backend/model health state
+# input: aiohttp requests, gateway config, backend/model health state, optional aistatus.cc model pre-checks
 # output: proxied HTTP responses plus gateway status/usage endpoints
-# pos: gateway proxy server and model fallback execution path
+# pos: gateway proxy server, global model health pre-check, and model fallback execution path
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Gateway HTTP server — transparent proxy with failover and key rotation."""
 
@@ -18,9 +18,11 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from ..api import StatusAPI
+from ..models import Status
+from ..usage import UsageTracker
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
-from ..usage import UsageTracker
 
 logger = logging.getLogger("aistatus.gateway")
 
@@ -39,6 +41,8 @@ class GatewayServer:
             timeout=aiohttp.ClientTimeout(total=300, connect=10),
             connector=aiohttp.TCPConnector(limit=100),
         )
+
+        await self._apply_global_model_health_precheck()
 
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
@@ -302,10 +306,25 @@ class GatewayServer:
             from .translate import openai_response_to_anthropic
             resp_body = openai_response_to_anthropic(resp_body, original_model)
             content_type = "application/json"
+            charset = None
         else:
-            content_type = upstream.headers.get("content-type", "application/json")
+            raw_content_type = upstream.headers.get("content-type", "application/json")
+            content_type, _, content_type_params = raw_content_type.partition(";")
+            content_type = content_type.strip() or "application/json"
+            charset = None
+            if content_type_params:
+                for param in content_type_params.split(";"):
+                    key, _, value = param.partition("=")
+                    if key.strip().lower() == "charset" and value.strip():
+                        charset = value.strip().strip('"')
+                        break
 
-        response = web.Response(body=resp_body, status=upstream.status, content_type=content_type)
+        response = web.Response(
+            body=resp_body,
+            status=upstream.status,
+            content_type=content_type,
+            charset=charset,
+        )
 
         self._record_usage_if_possible(
             backend=backend,
@@ -390,6 +409,49 @@ class GatewayServer:
             return json.loads(body).get("model", "") or ""
         except (json.JSONDecodeError, UnicodeDecodeError):
             return ""
+
+    async def _apply_global_model_health_precheck(self) -> None:
+        if not self.config.status_check:
+            return
+
+        model_targets: set[str] = set()
+        for endpoint in self.config.endpoints.values():
+            model_targets.update(endpoint.model_fallbacks.keys())
+            for candidates in endpoint.model_fallbacks.values():
+                model_targets.update(candidates)
+
+        if not model_targets:
+            return
+
+        client = StatusAPI()
+        checks = await asyncio.gather(
+            *(client.acheck_model(model) for model in sorted(model_targets)),
+            return_exceptions=True,
+        )
+        degraded_models = {
+            model
+            for model, result in zip(sorted(model_targets), checks, strict=False)
+            if not isinstance(result, Exception) and result.status in (Status.DEGRADED, Status.DOWN)
+        }
+        if not degraded_models:
+            return
+
+        for endpoint in self.config.endpoints.values():
+            endpoint_models = set(endpoint.model_fallbacks.keys())
+            endpoint_models.update(*(candidate for candidates in endpoint.model_fallbacks.values() for candidate in candidates))
+            unhealthy_models = endpoint_models & degraded_models
+            if not unhealthy_models:
+                continue
+
+            backend_ids = [f"{endpoint.name}:key:{i}" for i in range(len(endpoint.keys))]
+            if not endpoint.keys or endpoint.passthrough:
+                backend_ids.append(f"{endpoint.name}:passthrough")
+            backend_ids.extend(f"{endpoint.name}:fb:{fb.name}" for fb in endpoint.fallbacks)
+
+            for backend_id in backend_ids:
+                for model in unhealthy_models:
+                    self.health.record_error(backend_id, 529, model=model)
+                    logger.info("Pre-marked %s model unhealthy from global status: %s", backend_id, model)
 
     def _apply_model_fallback(
         self,
