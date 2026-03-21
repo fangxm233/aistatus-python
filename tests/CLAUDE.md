@@ -1,7 +1,7 @@
 一旦此文件夹有文件变化，请更新我
 
 SDK test suite for routing and gateway behavior.
-Covers backend selection, model health/fallback, global pre-checks, usage, and lifecycle regressions.
+Covers backend selection, model health/fallback, global pre-checks, charset-safe proxy responses, usage, and lifecycle regressions.
 Tests are written to validate gateway features before implementation changes.
 
 | filename | role | function |
