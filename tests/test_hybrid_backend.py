@@ -303,6 +303,84 @@ class TestStatusEndpoint:
         body = json.loads(resp.body)
         assert body["endpoints"]["openai"]["mode"] == "passthrough"
 
+    @pytest.mark.asyncio
+    async def test_status_includes_model_health_field(self):
+        """model_health should be a top-level field in /status response."""
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="anthropic",
+            keys=["sk-ant-managed"],
+            passthrough=True,
+        )
+        server = _make_server(ep)
+        request = MagicMock()
+
+        resp = await server._handle_status(request)
+
+        import json
+        body = json.loads(resp.body)
+        assert "model_health" in body
+        # Empty when no model-level data recorded
+        assert body["model_health"] == {}
+
+    @pytest.mark.asyncio
+    async def test_status_model_health_with_errors(self):
+        """model_health shows per-model healthy/unhealthy + recent_errors."""
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="anthropic",
+            keys=["sk-ant-managed"],
+            passthrough=True,
+        )
+        server = _make_server(ep)
+
+        # Simulate model-level errors: opus rate-limited, sonnet ok
+        bid = "anthropic:key:0"
+        for _ in range(5):
+            server.health.record_error(bid, 529, model="claude-opus-4-6")
+        server.health.record_success(bid, model="claude-sonnet-4-6")
+
+        request = MagicMock()
+        resp = await server._handle_status(request)
+
+        import json
+        body = json.loads(resp.body)
+
+        mh = body["model_health"]
+        assert "anthropic:key:0/claude-opus-4-6" in mh
+        assert mh["anthropic:key:0/claude-opus-4-6"]["healthy"] is False
+        assert mh["anthropic:key:0/claude-opus-4-6"]["recent_errors"] >= 1
+
+        assert "anthropic:key:0/claude-sonnet-4-6" in mh
+        assert mh["anthropic:key:0/claude-sonnet-4-6"]["healthy"] is True
+        assert mh["anthropic:key:0/claude-sonnet-4-6"]["total_errors"] == 0
+
+    @pytest.mark.asyncio
+    async def test_status_model_health_not_in_health_detail(self):
+        """model_health should NOT appear nested inside health_detail."""
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="anthropic",
+            keys=["sk-ant-managed"],
+        )
+        server = _make_server(ep)
+
+        # Record model-level data
+        server.health.record_error("anthropic:key:0", 529, model="claude-opus-4-6")
+
+        request = MagicMock()
+        resp = await server._handle_status(request)
+
+        import json
+        body = json.loads(resp.body)
+
+        # model_health should be top-level, not nested in health_detail
+        assert "model_health" not in body["health_detail"]
+        assert "model_health" in body
+
 
 # -----------------------------------------------------------------------
 # Test: Config loading parses passthrough field
