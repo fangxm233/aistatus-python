@@ -9,5 +9,6 @@ Tests are written to validate gateway features before implementation changes.
 | `test_hybrid_backend.py` | regression | Verify backend ordering, config parsing, and status reporting |
 | `test_proxy_model_extraction.py` | regression | Verify model extraction, global model pre-checks, model health tracking, and model fallback behavior |
 | `test_usage_endpoint.py` | regression | Verify `/usage` HTTP endpoint summaries and validation |
+| `test_pricing.py` | regression | Verify pricing lookup handles versioned Claude model IDs and base aliases |
 | `test_model_health.py` | regression | Verify `HealthTracker` backend/model dual-layer behavior |
 | `test_graceful_shutdown.py` | regression | Verify signal handling and PID cleanup |
