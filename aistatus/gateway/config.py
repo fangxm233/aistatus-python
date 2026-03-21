@@ -1,3 +1,7 @@
+# input: gateway.yaml data, env vars, default endpoint presets
+# output: validated GatewayConfig/EndpointConfig objects for the gateway runtime
+# pos: gateway config loader and validator
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Gateway configuration: loading, validation, auto-discovery."""
 
 from __future__ import annotations
@@ -78,6 +82,15 @@ class EndpointConfig:
 
     Set ``passthrough: false`` in the config to disable passthrough and
     use only the managed keys.
+
+    ``model_fallbacks`` maps model names to ordered fallback lists for
+    automatic model-level degradation.  Example::
+
+        model_fallbacks:
+          claude-opus-4-6:
+            - claude-sonnet-4-6
+          claude-sonnet-4-6:
+            - claude-haiku-4-5
     """
 
     name: str
@@ -86,6 +99,7 @@ class EndpointConfig:
     keys: list[str] = field(default_factory=list)
     passthrough: bool = True
     fallbacks: list[FallbackConfig] = field(default_factory=list)
+    model_fallbacks: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -180,16 +194,43 @@ class GatewayConfig:
                 )
 
             passthrough = ep_raw.get("passthrough", True)
+            model_fallbacks = _parse_model_fallbacks(ep_raw.get("model_fallbacks", {}))
 
             endpoints[ep_name] = EndpointConfig(
                 name=ep_name, base_url=base_url, auth_style=auth_style,
                 keys=keys, passthrough=bool(passthrough), fallbacks=fallbacks,
+                model_fallbacks=model_fallbacks,
             )
 
         return cls(host=host, port=port, status_check=status_check, endpoints=endpoints)
 
 
 # --- helpers ---
+
+def _parse_model_fallbacks(raw: Any) -> dict[str, list[str]]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("model_fallbacks must be a mapping")
+
+    parsed: dict[str, list[str]] = {}
+    for model, candidates in raw.items():
+        source = str(model).strip()
+        if not source:
+            raise ValueError("source model must be a non-empty string")
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError(f"model_fallbacks[{source!r}] fallback list must be a non-empty list")
+
+        parsed_candidates: list[str] = []
+        for candidate in candidates:
+            target = str(candidate).strip()
+            if not target:
+                raise ValueError(f"model_fallbacks[{source!r}] fallback target must be a non-empty string")
+            parsed_candidates.append(target)
+        parsed[source] = parsed_candidates
+
+    return parsed
+
 
 def _resolve_single(val: str) -> str:
     """Resolve $ENV_VAR references."""
@@ -231,7 +272,12 @@ anthropic:
   # Hybrid mode: when true (default), the caller's own API key is
   # tried after managed keys, before fallbacks.
   # Set to false to use only managed keys.
-  # passthrough: true
+  # Automatic model-level degradation order.
+  # When a model is unhealthy, later tasks can switch to the first healthy fallback.
+  # model_fallbacks:
+  #   claude-opus-4-6:
+  #     - claude-sonnet-4-6
+  #     - claude-haiku-4-5
 
   fallbacks:
     # OpenRouter serves Claude models via OpenAI-compatible API

@@ -1,3 +1,7 @@
+# input: aiohttp requests, gateway config, backend/model health state
+# output: proxied HTTP responses plus gateway status/usage endpoints
+# pos: gateway proxy server and model fallback execution path
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Gateway HTTP server — transparent proxy with failover and key rotation."""
 
 from __future__ import annotations
@@ -83,7 +87,7 @@ class GatewayServer:
             )
 
         body = await request.read()
-        model = self._extract_model(body)
+        original_model = self._extract_model(body)
         backends = self._build_backend_list(endpoint, request)
 
         if not backends:
@@ -94,8 +98,11 @@ class GatewayServer:
 
         last_err: _ProxyError | None = None
         for backend in backends:
+            model, effective_body, fallback_header = self._apply_model_fallback(
+                endpoint, backend["id"], body, original_model
+            )
             try:
-                return await self._forward(request, backend, path, body, model)
+                return await self._forward(request, backend, path, effective_body, model, fallback_header)
             except _ProxyError as e:
                 last_err = e
                 self.health.record_error(backend["id"], e.status)
@@ -207,6 +214,7 @@ class GatewayServer:
         path: str,
         body: bytes,
         model: str = "",
+        fallback_header: str = "",
     ) -> web.StreamResponse:
         assert self._session is not None
 
@@ -274,9 +282,9 @@ class GatewayServer:
         is_streaming = "text/event-stream" in content_type
 
         if is_streaming:
-            return await self._stream(request, resp, backend, original_model)
+            return await self._stream(request, resp, backend, original_model, fallback_header)
         else:
-            return await self._respond(resp, backend, original_model, elapsed_ms)
+            return await self._respond(resp, backend, original_model, elapsed_ms, fallback_header)
 
     async def _respond(
         self,
@@ -284,6 +292,7 @@ class GatewayServer:
         backend: dict[str, Any],
         original_model: str,
         elapsed_ms: int,
+        fallback_header: str = "",
     ) -> web.Response:
         """Non-streaming response."""
         resp_body = await upstream.read()
@@ -311,6 +320,8 @@ class GatewayServer:
                 response.headers[h] = upstream.headers[h]
         response.headers["x-gateway-backend"] = backend["id"]
         response.headers["x-gateway-ms"] = str(elapsed_ms)
+        if fallback_header:
+            response.headers["x-gateway-model-fallback"] = fallback_header
         return response
 
     async def _stream(
@@ -319,6 +330,7 @@ class GatewayServer:
         upstream: aiohttp.ClientResponse,
         backend: dict[str, Any],
         original_model: str,
+        fallback_header: str = "",
     ) -> web.StreamResponse:
         """Streaming (SSE) response."""
         needs_translate = backend["translate"] == "anthropic-to-openai"
@@ -330,6 +342,8 @@ class GatewayServer:
             resp.headers["Cache-Control"] = "no-cache"
             resp.headers["Connection"] = "keep-alive"
             resp.headers["x-gateway-backend"] = backend["id"]
+            if fallback_header:
+                resp.headers["x-gateway-model-fallback"] = fallback_header
             await resp.prepare(request)
 
             from .translate import openai_sse_to_anthropic_sse
@@ -350,6 +364,8 @@ class GatewayServer:
             resp.headers["Cache-Control"] = "no-cache"
             resp.headers["Connection"] = "keep-alive"
             resp.headers["x-gateway-backend"] = backend["id"]
+            if fallback_header:
+                resp.headers["x-gateway-model-fallback"] = fallback_header
             for h in ("x-request-id", "openai-organization"):
                 if h in upstream.headers:
                     resp.headers[h] = upstream.headers[h]
@@ -375,6 +391,32 @@ class GatewayServer:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return ""
 
+    def _apply_model_fallback(
+        self,
+        endpoint: EndpointConfig,
+        backend_id: str,
+        body: bytes,
+        original_model: str,
+    ) -> tuple[str, bytes, str]:
+        if not body or not original_model:
+            return original_model, body, ""
+
+        if self.health.is_healthy(backend_id, model=original_model):
+            return original_model, body, ""
+
+        candidates = endpoint.model_fallbacks.get(original_model, [])
+        if not candidates:
+            return original_model, body, ""
+
+        for candidate in candidates:
+            if not self.health.is_healthy(backend_id, model=candidate):
+                continue
+            rewritten = self._replace_model(body, candidate)
+            if rewritten != body:
+                return candidate, rewritten, f"{original_model}->{candidate}"
+
+        return original_model, body, ""
+
     @staticmethod
     def _build_upstream_headers(
         request: web.Request, backend: dict[str, Any]
@@ -396,6 +438,18 @@ class GatewayServer:
         headers[header_name] = prefix + backend["api_key"]
 
         return headers
+
+    @staticmethod
+    def _replace_model(body: bytes, model: str) -> bytes:
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return body
+
+        if not data.get("model"):
+            return body
+        data["model"] = model
+        return json.dumps(data).encode()
 
     @staticmethod
     def _map_model(body: bytes, backend: dict[str, Any]) -> bytes:
