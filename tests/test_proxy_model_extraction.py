@@ -94,6 +94,27 @@ class TestModelHealthOnSuccess:
     """Proxy handler records model-level success stats."""
 
     @pytest.mark.asyncio
+    async def test_global_degraded_model_is_pre_marked_unhealthy(self):
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="bearer",
+            keys=["sk-managed"],
+            model_fallbacks={"claude-opus-4-6": ["claude-sonnet-4-6"]},
+        )
+        server = _make_server(ep)
+
+        with patch("aistatus.gateway.server.StatusAPI", create=True) as mock_status_api:
+            mock_client = MagicMock()
+            mock_client.acheck_model = AsyncMock(return_value=MagicMock(status="degraded"))
+            mock_status_api.return_value = mock_client
+
+            await server._apply_global_model_health_precheck()
+
+        assert not server.health.is_healthy("anthropic:key:0", model="claude-opus-4-6")
+        assert server.health.is_healthy("anthropic:key:0", model="claude-sonnet-4-6")
+
+    @pytest.mark.asyncio
     async def test_success_records_model_health(self):
         """Successful proxy request records both backend and model health."""
         ep = EndpointConfig(
@@ -142,6 +163,42 @@ class TestModelHealthOnSuccess:
         assert call_args[0][4] == "claude-sonnet-4-6"
         forwarded_body = call_args[0][3]
         assert json.loads(forwarded_body)["model"] == "claude-sonnet-4-6"
+
+    @pytest.mark.asyncio
+    async def test_respond_preserves_charset_without_value_error(self):
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="bearer",
+            keys=["sk-managed"],
+        )
+        server = _make_server(ep)
+
+        upstream = AsyncMock()
+        upstream.read = AsyncMock(return_value=b'{"content": "hello", "usage": {}}')
+        upstream.release = MagicMock()
+        upstream.status = 200
+        upstream.headers = {"content-type": "application/json; charset=utf-8"}
+
+        backend = {
+            "id": "anthropic:key:0",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-test",
+            "auth_style": "bearer",
+            "model_prefix": "",
+            "model_map": {},
+            "translate": None,
+        }
+
+        response = await server._respond(
+            upstream,
+            backend,
+            "claude-opus-4-6",
+            123,
+        )
+
+        assert response.content_type == "application/json"
+        assert response.charset == "utf-8"
 
     @pytest.mark.asyncio
     async def test_respond_sets_model_fallback_header(self):
