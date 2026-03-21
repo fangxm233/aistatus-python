@@ -1,7 +1,7 @@
 一旦此文件夹有文件变化，请更新我
 
 Gateway proxy/config/health module for local LLM routing.
-Handles config parsing, global model pre-checks, backend selection, model degradation fallback, and HTTP proxy responses.
+Handles config parsing, global model pre-checks, backend selection, model degradation fallback, HTTP proxy responses, and charset-safe response forwarding.
 Shared by the SDK gateway runtime without Cortex-specific logic.
 
 | filename | role | function |
