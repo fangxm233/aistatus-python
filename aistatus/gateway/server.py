@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
@@ -48,16 +50,21 @@ class GatewayServer:
         self._write_pid_file()
         self._print_banner()
 
+        shutdown_event = asyncio.Event()
+        self._install_signal_handlers(shutdown_event)
+
         try:
-            import asyncio
-            await asyncio.Event().wait()  # run forever
+            await shutdown_event.wait()
+            logger.info("Shutdown signal received, stopping gracefully...")
         except (KeyboardInterrupt, SystemExit):
+            # Windows fallback: SIGINT raises KeyboardInterrupt
             pass
         finally:
             self._remove_pid_file()
             if self._session:
                 await self._session.close()
             await runner.cleanup()
+            logger.info("Gateway stopped")
 
     # ------------------------------------------------------------------
     # Proxy handler
@@ -489,6 +496,26 @@ class GatewayServer:
             "endpoints": info,
             "health_detail": self.health.summary(),
         })
+
+    # ------------------------------------------------------------------
+    # Signal handling
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _install_signal_handlers(shutdown_event: asyncio.Event) -> None:
+        """Install SIGTERM/SIGINT handlers for graceful shutdown."""
+        loop = asyncio.get_running_loop()
+        try:
+            # Unix: register via event loop (works with asyncio)
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, shutdown_event.set)
+        except NotImplementedError:
+            # Windows: add_signal_handler not supported
+            # SIGINT is handled via KeyboardInterrupt (caught in run())
+            signal.signal(
+                signal.SIGTERM,
+                lambda s, f: loop.call_soon_threadsafe(shutdown_event.set),
+            )
 
     # ------------------------------------------------------------------
     # PID file
