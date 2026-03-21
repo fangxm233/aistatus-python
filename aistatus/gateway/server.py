@@ -39,6 +39,7 @@ class GatewayServer:
         app = web.Application()
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/status", self._handle_status)
+        app.router.add_get("/usage", self._handle_usage)
         # Catch-all proxy: /{endpoint}/...
         app.router.add_route("*", "/{endpoint}/{path:.*}", self._handle_proxy)
 
@@ -82,6 +83,7 @@ class GatewayServer:
             )
 
         body = await request.read()
+        model = self._extract_model(body)
         backends = self._build_backend_list(endpoint, request)
 
         if not backends:
@@ -93,10 +95,12 @@ class GatewayServer:
         last_err: _ProxyError | None = None
         for backend in backends:
             try:
-                return await self._forward(request, backend, path, body)
+                return await self._forward(request, backend, path, body, model)
             except _ProxyError as e:
                 last_err = e
                 self.health.record_error(backend["id"], e.status)
+                if model:
+                    self.health.record_error(backend["id"], e.status, model=model)
                 logger.warning(
                     "%s → %d, trying next backend", backend["id"], e.status
                 )
@@ -202,14 +206,15 @@ class GatewayServer:
         backend: dict[str, Any],
         path: str,
         body: bytes,
+        model: str = "",
     ) -> web.StreamResponse:
         assert self._session is not None
 
         needs_translate = backend["translate"] == "anthropic-to-openai"
 
-        # Determine original model for response translation
-        original_model = ""
-        if needs_translate and body:
+        # Use pre-extracted model; fall back to body parse for translation
+        original_model = model
+        if not original_model and needs_translate and body:
             try:
                 original_model = json.loads(body).get("model", "")
             except Exception:
@@ -262,6 +267,8 @@ class GatewayServer:
             raise _ProxyError(resp.status, err_body)
 
         self.health.record_success(backend["id"])
+        if model:
+            self.health.record_success(backend["id"], model=model)
 
         content_type = resp.headers.get("content-type", "")
         is_streaming = "text/event-stream" in content_type
@@ -357,6 +364,16 @@ class GatewayServer:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_model(body: bytes) -> str:
+        """Extract model field from JSON request body."""
+        if not body:
+            return ""
+        try:
+            return json.loads(body).get("model", "") or ""
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return ""
 
     @staticmethod
     def _build_upstream_headers(
@@ -492,9 +509,13 @@ class GatewayServer:
                 })
             info[ep_name] = ep_info
 
+        health_summary = self.health.summary()
+        model_health = health_summary.pop("model_health", {})
+
         return web.json_response({
             "endpoints": info,
-            "health_detail": self.health.summary(),
+            "health_detail": health_summary,
+            "model_health": model_health,
         })
 
     # ------------------------------------------------------------------
