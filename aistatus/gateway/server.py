@@ -105,12 +105,20 @@ class GatewayServer:
     def _build_backend_list(
         self, endpoint: EndpointConfig, request: web.Request
     ) -> list[dict[str, Any]]:
-        """Build ordered list of backends to try."""
+        """Build ordered list of backends to try.
+
+        Hybrid mode (keys present AND passthrough=True):
+          managed keys → passthrough (caller's own key) → fallbacks.
+        Managed-only (keys present AND passthrough=False):
+          managed keys → fallbacks.
+        Passthrough-only (no keys):
+          passthrough → fallbacks.
+        """
         backends: list[dict[str, Any]] = []
         ep = endpoint.name
 
+        # 1. Managed keys (if any)
         if endpoint.keys:
-            # Key rotation mode
             idx = self._key_idx.get(ep, 0)
             n = len(endpoint.keys)
             for i in range(n):
@@ -119,14 +127,17 @@ class GatewayServer:
                 if self.health.is_healthy(bid):
                     backends.append(self._primary_backend(bid, endpoint, endpoint.keys[ki]))
             self._key_idx[ep] = (idx + 1) % n
-        else:
-            # Passthrough mode — forward the incoming auth header
+
+        # 2. Passthrough — forward incoming auth header
+        #    Used when: no managed keys, OR hybrid mode (keys + passthrough=True)
+        if not endpoint.keys or endpoint.passthrough:
             bid = f"{ep}:passthrough"
             if self.health.is_healthy(bid):
                 incoming_key = self._extract_incoming_key(request, endpoint.auth_style)
-                backends.append(self._primary_backend(bid, endpoint, incoming_key))
+                if incoming_key:
+                    backends.append(self._primary_backend(bid, endpoint, incoming_key))
 
-        # Fallbacks
+        # 3. Fallbacks
         for fb in endpoint.fallbacks:
             bid = f"{ep}:fb:{fb.name}"
             if not self.health.is_healthy(bid) or not fb.api_key:
@@ -446,17 +457,21 @@ class GatewayServer:
     async def _handle_status(self, request: web.Request) -> web.Response:
         info: dict[str, Any] = {}
         for ep_name, ep in self.config.endpoints.items():
-            ep_info: dict[str, Any] = {"backends": []}
+            ep_info: dict[str, Any] = {"backends": [], "mode": "passthrough"}
             for i in range(len(ep.keys)):
                 bid = f"{ep_name}:key:{i}"
                 ep_info["backends"].append({
                     "id": bid, "type": "primary", "healthy": self.health.is_healthy(bid),
                 })
-            if not ep.keys:
+            if not ep.keys or ep.passthrough:
                 bid = f"{ep_name}:passthrough"
                 ep_info["backends"].append({
                     "id": bid, "type": "passthrough", "healthy": self.health.is_healthy(bid),
                 })
+            if ep.keys and ep.passthrough:
+                ep_info["mode"] = "hybrid"
+            elif ep.keys:
+                ep_info["mode"] = "managed"
             for fb in ep.fallbacks:
                 bid = f"{ep_name}:fb:{fb.name}"
                 ep_info["backends"].append({
@@ -482,7 +497,12 @@ class GatewayServer:
         for ep_name, ep in self.config.endpoints.items():
             nk = len(ep.keys)
             nf = len(ep.fallbacks)
-            key_info = f"{nk} key{'s' if nk != 1 else ''}" if nk else "passthrough"
+            if nk and ep.passthrough:
+                key_info = f"{nk} key{'s' if nk != 1 else ''} + passthrough"
+            elif nk:
+                key_info = f"{nk} key{'s' if nk != 1 else ''}"
+            else:
+                key_info = "passthrough"
             fb_names = ", ".join(f.name for f in ep.fallbacks)
             fb_info = f" → fallback: {fb_names}" if fb_names else ""
             print(f"  /{ep_name}/*  ({key_info}{fb_info})")

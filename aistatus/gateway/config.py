@@ -69,12 +69,22 @@ class FallbackConfig:
 
 @dataclass
 class EndpointConfig:
-    """One endpoint group (anthropic / openai / google)."""
+    """One endpoint group (anthropic / openai / google).
+
+    When ``keys`` are set AND ``passthrough`` is True (the default),
+    the gateway operates in **hybrid** mode: managed keys are tried first,
+    then the caller's own key (forwarded from the incoming request header)
+    is tried as an additional backend before moving on to fallbacks.
+
+    Set ``passthrough: false`` in the config to disable passthrough and
+    use only the managed keys.
+    """
 
     name: str
     base_url: str
     auth_style: str  # "anthropic" | "bearer" | "google"
     keys: list[str] = field(default_factory=list)
+    passthrough: bool = True
     fallbacks: list[FallbackConfig] = field(default_factory=list)
 
 
@@ -169,9 +179,11 @@ class GatewayConfig:
                     )
                 )
 
+            passthrough = ep_raw.get("passthrough", True)
+
             endpoints[ep_name] = EndpointConfig(
                 name=ep_name, base_url=base_url, auth_style=auth_style,
-                keys=keys, fallbacks=fallbacks,
+                keys=keys, passthrough=bool(passthrough), fallbacks=fallbacks,
             )
 
         return cls(host=host, port=port, status_check=status_check, endpoints=endpoints)
@@ -215,6 +227,11 @@ anthropic:
   keys:
     - $ANTHROPIC_API_KEY
     # - sk-ant-your-second-key
+
+  # Hybrid mode: when true (default), the caller's own API key is
+  # tried after managed keys, before fallbacks.
+  # Set to false to use only managed keys.
+  # passthrough: true
 
   fallbacks:
     # OpenRouter serves Claude models via OpenAI-compatible API

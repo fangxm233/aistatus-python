@@ -17,6 +17,11 @@ anthropic:
     - $ANTHROPIC_API_KEY
     # - sk-ant-your-backup-key
 
+  # Hybrid mode (default: true): when keys are set, the caller's
+  # own API key is also tried after managed keys, before fallbacks.
+  # Set to false to use only managed keys.
+  # passthrough: true
+
   fallbacks:
     # OpenRouter serves Claude models via OpenAI-compatible API.
     # Gateway automatically translates Anthropic ↔ OpenAI format.
