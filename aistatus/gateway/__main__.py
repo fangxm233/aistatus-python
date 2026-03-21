@@ -22,6 +22,14 @@ def main():
         "--auto", action="store_true",
         help="Auto-discover providers from env vars (no config file needed)",
     )
+    start_p.add_argument(
+        "--pid-file", metavar="PATH",
+        help="Write PID to this file on start, remove on exit",
+    )
+    start_p.add_argument(
+        "--log-file", metavar="PATH",
+        help="Redirect logs to this file instead of stderr",
+    )
 
     # --- init ---
     init_p = sub.add_parser("init", help="Generate example config file")
@@ -46,6 +54,8 @@ def _do_start(args):
         host=getattr(args, "host", "127.0.0.1"),
         port=getattr(args, "port", 9880),
         auto=getattr(args, "auto", False),
+        pid_file=getattr(args, "pid_file", None),
+        log_file=getattr(args, "log_file", None),
     )
 
 

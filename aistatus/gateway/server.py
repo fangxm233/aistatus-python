@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -18,12 +20,13 @@ logger = logging.getLogger("aistatus.gateway")
 
 
 class GatewayServer:
-    def __init__(self, config: GatewayConfig):
+    def __init__(self, config: GatewayConfig, pid_file: str | None = None):
         self.config = config
         self.health = HealthTracker()
         self.usage = UsageTracker()
         self._session: aiohttp.ClientSession | None = None
         self._key_idx: dict[str, int] = {}  # round-robin counters
+        self._pid_file: Path | None = Path(pid_file) if pid_file else None
 
     async def run(self):
         self._session = aiohttp.ClientSession(
@@ -42,6 +45,7 @@ class GatewayServer:
         site = web.TCPSite(runner, self.config.host, self.config.port)
         await site.start()
 
+        self._write_pid_file()
         self._print_banner()
 
         try:
@@ -50,6 +54,7 @@ class GatewayServer:
         except (KeyboardInterrupt, SystemExit):
             pass
         finally:
+            self._remove_pid_file()
             if self._session:
                 await self._session.close()
             await runner.cleanup()
@@ -484,6 +489,26 @@ class GatewayServer:
             "endpoints": info,
             "health_detail": self.health.summary(),
         })
+
+    # ------------------------------------------------------------------
+    # PID file
+    # ------------------------------------------------------------------
+
+    def _write_pid_file(self) -> None:
+        if not self._pid_file:
+            return
+        self._pid_file.parent.mkdir(parents=True, exist_ok=True)
+        self._pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        logger.info("PID %d written to %s", os.getpid(), self._pid_file)
+
+    def _remove_pid_file(self) -> None:
+        if not self._pid_file:
+            return
+        try:
+            self._pid_file.unlink(missing_ok=True)
+            logger.info("PID file removed: %s", self._pid_file)
+        except OSError as e:
+            logger.warning("Failed to remove PID file %s: %s", self._pid_file, e)
 
     # ------------------------------------------------------------------
     # Banner
