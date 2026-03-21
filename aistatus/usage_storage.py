@@ -109,6 +109,8 @@ class UsageStorage:
     @staticmethod
     def _period_since(period: str) -> datetime | None:
         now = datetime.now(timezone.utc)
+        if period == "today":
+            return now.replace(hour=0, minute=0, second=0, microsecond=0)
         if period == "week":
             return now - timedelta(days=7)
         if period == "month":
