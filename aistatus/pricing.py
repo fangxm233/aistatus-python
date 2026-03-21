@@ -1,3 +1,8 @@
+# input: aistatus.cc model search API, cached pricing records, provider/model identifiers
+# output: per-model pricing lookup and USD cost estimates for usage tracking
+# pos: SDK pricing normalization and lookup layer shared by UsageTracker
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 from __future__ import annotations
 
 import json
@@ -156,6 +161,9 @@ class CostCalculator:
         normalized = self._normalize_model_id(model_name)
         if normalized != model_name:
             variants.append(normalized)
+        versions = self._version_aliases(model_name)
+        variants.extend(versions)
+        variants.extend(version.replace(".", "-") for version in versions)
         variants.append(normalized.replace(".", "-"))
         variants.append(normalized.replace("-", " "))
 
@@ -168,6 +176,14 @@ class CostCalculator:
             seen.add(variant)
             deduped.append(variant)
         return deduped
+
+    @classmethod
+    def _version_aliases(cls, model_name: str) -> list[str]:
+        match = re.fullmatch(r"(.+?)-(\d+)-(\d+)-(\d{8})", model_name.lower().strip())
+        if not match:
+            return []
+        prefix, major, minor, _date = match.groups()
+        return [f"{prefix}-{major}.{minor}"]
 
     @staticmethod
     def _to_float(value: Any) -> float | None:
