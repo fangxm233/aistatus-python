@@ -1,7 +1,3 @@
-# input: aiohttp requests, gateway config, backend/model health state, optional aistatus.cc model pre-checks
-# output: proxied HTTP responses plus gateway status/usage endpoints
-# pos: gateway proxy server, global model health pre-check, and model fallback execution path
-# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Gateway HTTP server — transparent proxy with failover and key rotation."""
 
 from __future__ import annotations
@@ -20,7 +16,9 @@ from aiohttp import web
 
 from ..api import StatusAPI
 from ..models import Status
+from ..pricing import CostCalculator
 from ..usage import UsageTracker
+from .auth import check_gateway_auth
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
 
@@ -32,6 +30,7 @@ class GatewayServer:
         self.config = config
         self.health = HealthTracker()
         self.usage = UsageTracker()
+        self.pricing = CostCalculator()
         self._session: aiohttp.ClientSession | None = None
         self._key_idx: dict[str, int] = {}  # round-robin counters
         self._pid_file: Path | None = Path(pid_file) if pid_file else None
@@ -48,6 +47,9 @@ class GatewayServer:
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/status", self._handle_status)
         app.router.add_get("/usage", self._handle_usage)
+        app.router.add_post("/mode", self._handle_mode_switch)
+        # Per-request mode routing: /m/{mode}/{endpoint}/{path}
+        app.router.add_route("*", "/m/{mode}/{endpoint}/{path:.*}", self._handle_mode_proxy)
         # Catch-all proxy: /{endpoint}/...
         app.router.add_route("*", "/{endpoint}/{path:.*}", self._handle_proxy)
 
@@ -66,7 +68,6 @@ class GatewayServer:
             await shutdown_event.wait()
             logger.info("Shutdown signal received, stopping gracefully...")
         except (KeyboardInterrupt, SystemExit):
-            # Windows fallback: SIGINT raises KeyboardInterrupt
             pass
         finally:
             self._remove_pid_file()
@@ -76,10 +77,59 @@ class GatewayServer:
             logger.info("Gateway stopped")
 
     # ------------------------------------------------------------------
+    # Auth middleware
+    # ------------------------------------------------------------------
+
+    def _check_auth(self, request: web.Request) -> bool:
+        """Check request authorization against gateway auth config."""
+        if not self.config.auth:
+            return True
+        headers = {k.lower(): v for k, v in request.headers.items()}
+        return check_gateway_auth(self.config.auth, request.path, headers)
+
+    # ------------------------------------------------------------------
+    # Mode proxy handler
+    # ------------------------------------------------------------------
+
+    async def _handle_mode_proxy(self, request: web.Request) -> web.StreamResponse:
+        """Handle per-request mode routing: /m/{mode}/{endpoint}/{path}."""
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": {"message": "Unauthorized", "type": "gateway_error"}},
+                status=401,
+            )
+
+        mode = request.match_info["mode"]
+        ep_name = request.match_info["endpoint"]
+        path = request.match_info["path"]
+
+        mode_endpoints = self.config.endpoint_modes.get(mode)
+        if not mode_endpoints:
+            return web.json_response(
+                {"error": {"message": f"Unknown mode: {mode}", "type": "gateway_error"}},
+                status=404,
+            )
+
+        endpoint = mode_endpoints.get(ep_name)
+        if not endpoint:
+            return web.json_response(
+                {"error": {"message": f"Unknown endpoint '{ep_name}' in mode '{mode}'", "type": "gateway_error"}},
+                status=404,
+            )
+
+        return await self._proxy_request(request, endpoint, path)
+
+    # ------------------------------------------------------------------
     # Proxy handler
     # ------------------------------------------------------------------
 
     async def _handle_proxy(self, request: web.Request) -> web.StreamResponse:
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": {"message": "Unauthorized", "type": "gateway_error"}},
+                status=401,
+            )
+
         ep_name = request.match_info["endpoint"]
         path = request.match_info["path"]
 
@@ -90,6 +140,10 @@ class GatewayServer:
                 status=404,
             )
 
+        return await self._proxy_request(request, endpoint, path)
+
+    async def _proxy_request(self, request: web.Request, endpoint: EndpointConfig, path: str) -> web.StreamResponse:
+        """Core proxy logic shared by both standard and mode-aware handlers."""
         body = await request.read()
         original_model = self._extract_model(body)
         backends = self._build_backend_list(endpoint, request)
@@ -126,21 +180,49 @@ class GatewayServer:
         )
 
     # ------------------------------------------------------------------
+    # Mode switch handler
+    # ------------------------------------------------------------------
+
+    async def _handle_mode_switch(self, request: web.Request) -> web.Response:
+        """Switch the active endpoint mode. POST /mode with {"mode": "prod"}."""
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": {"message": "Unauthorized", "type": "gateway_error"}},
+                status=401,
+            )
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": {"message": "Invalid JSON body", "type": "gateway_error"}},
+                status=400,
+            )
+
+        new_mode = data.get("mode")
+        if not new_mode or new_mode not in self.config.endpoint_modes:
+            available = list(self.config.endpoint_modes.keys())
+            return web.json_response(
+                {"error": {"message": f"Unknown mode: {new_mode}. Available: {available}", "type": "gateway_error"}},
+                status=400,
+            )
+
+        self.config.mode = new_mode
+        self.config.endpoints = self.config.endpoint_modes[new_mode]
+        logger.info("Switched to mode: %s", new_mode)
+
+        return web.json_response({
+            "mode": new_mode,
+            "endpoints": list(self.config.endpoints.keys()),
+        })
+
+    # ------------------------------------------------------------------
     # Backend selection
     # ------------------------------------------------------------------
 
     def _build_backend_list(
         self, endpoint: EndpointConfig, request: web.Request
     ) -> list[dict[str, Any]]:
-        """Build ordered list of backends to try.
-
-        Hybrid mode (keys present AND passthrough=True):
-          managed keys → passthrough (caller's own key) → fallbacks.
-        Managed-only (keys present AND passthrough=False):
-          managed keys → fallbacks.
-        Passthrough-only (no keys):
-          passthrough → fallbacks.
-        """
         backends: list[dict[str, Any]] = []
         ep = endpoint.name
 
@@ -155,8 +237,7 @@ class GatewayServer:
                     backends.append(self._primary_backend(bid, endpoint, endpoint.keys[ki]))
             self._key_idx[ep] = (idx + 1) % n
 
-        # 2. Passthrough — forward incoming auth header
-        #    Used when: no managed keys, OR hybrid mode (keys + passthrough=True)
+        # 2. Passthrough
         if not endpoint.keys or endpoint.passthrough:
             bid = f"{ep}:passthrough"
             if self.health.is_healthy(bid):
@@ -201,7 +282,6 @@ class GatewayServer:
             return request.headers.get("x-api-key", "")
         if auth_style == "google":
             return request.headers.get("x-goog-api-key", "")
-        # bearer
         auth = request.headers.get("authorization", "")
         if auth.lower().startswith("bearer "):
             return auth[7:]
@@ -224,7 +304,6 @@ class GatewayServer:
 
         needs_translate = backend["translate"] == "anthropic-to-openai"
 
-        # Use pre-extracted model; fall back to body parse for translation
         original_model = model
         if not original_model and needs_translate and body:
             try:
@@ -232,7 +311,6 @@ class GatewayServer:
             except Exception:
                 pass
 
-        # --- build target URL ---
         effective_path = path
         if needs_translate and "v1/messages" in path:
             effective_path = "v1/chat/completions"
@@ -242,20 +320,16 @@ class GatewayServer:
         if request.query_string:
             url += f"?{request.query_string}"
 
-        # --- headers ---
         headers = self._build_upstream_headers(request, backend)
 
-        # --- body ---
         upstream_body = body
         if needs_translate and body:
             from .translate import anthropic_request_to_openai
             upstream_body = anthropic_request_to_openai(body)
 
-        # Apply model mapping / prefix
         if body and (backend["model_map"] or backend["model_prefix"]):
             upstream_body = self._map_model(upstream_body, backend)
 
-        # --- send request ---
         t0 = time.monotonic()
         try:
             resp = await self._session.request(
@@ -272,7 +346,6 @@ class GatewayServer:
 
         elapsed_ms = round((time.monotonic() - t0) * 1000)
 
-        # Check retryable status
         if resp.status in (429, 500, 502, 503, 529):
             err_body = await resp.read()
             resp.release()
@@ -298,7 +371,6 @@ class GatewayServer:
         elapsed_ms: int,
         fallback_header: str = "",
     ) -> web.Response:
-        """Non-streaming response."""
         resp_body = await upstream.read()
         upstream.release()
 
@@ -333,7 +405,6 @@ class GatewayServer:
             elapsed_ms=elapsed_ms,
         )
 
-        # Forward selected headers
         for h in ("x-request-id", "openai-organization", "anthropic-ratelimit-requests-remaining"):
             if h in upstream.headers:
                 response.headers[h] = upstream.headers[h]
@@ -351,11 +422,9 @@ class GatewayServer:
         original_model: str,
         fallback_header: str = "",
     ) -> web.StreamResponse:
-        """Streaming (SSE) response."""
         needs_translate = backend["translate"] == "anthropic-to-openai"
 
         if needs_translate:
-            # OpenAI SSE → Anthropic SSE
             resp = web.StreamResponse()
             resp.content_type = "text/event-stream"
             resp.headers["Cache-Control"] = "no-cache"
@@ -377,7 +446,6 @@ class GatewayServer:
             upstream.release()
             return resp
         else:
-            # Direct SSE passthrough
             resp = web.StreamResponse()
             resp.content_type = "text/event-stream"
             resp.headers["Cache-Control"] = "no-cache"
@@ -402,7 +470,6 @@ class GatewayServer:
 
     @staticmethod
     def _extract_model(body: bytes) -> str:
-        """Extract model field from JSON request body."""
         if not body:
             return ""
         try:
@@ -485,7 +552,6 @@ class GatewayServer:
     ) -> dict[str, str]:
         headers: dict[str, str] = {}
 
-        # Copy safe headers from original request
         skip = {
             "host", "authorization", "x-api-key", "x-goog-api-key",
             "content-length", "transfer-encoding", "connection",
@@ -494,7 +560,6 @@ class GatewayServer:
             if k.lower() not in skip:
                 headers[k] = v
 
-        # Set upstream auth
         style = AUTH_STYLES.get(backend["auth_style"], AUTH_STYLES["bearer"])
         header_name, prefix = style
         headers[header_name] = prefix + backend["api_key"]
@@ -524,7 +589,6 @@ class GatewayServer:
         if not model:
             return body
 
-        # Exact mapping takes priority
         if model in backend["model_map"]:
             data["model"] = backend["model_map"][model]
         elif backend["model_prefix"]:
@@ -554,17 +618,37 @@ class GatewayServer:
         output_tokens = self._as_int(
             usage.get("output_tokens", usage.get("completion_tokens", 0))
         )
+        cache_creation_in = self._as_int(usage.get("cache_creation_input_tokens", 0))
+        cache_read_in = self._as_int(usage.get("cache_read_input_tokens", 0))
+
         if not model and not input_tokens and not output_tokens:
             return
 
         provider = self._infer_provider_from_backend(backend, model)
+
+        # Calculate cost using CostCalculator
+        if cache_creation_in or cache_read_in:
+            cost = self.pricing.calculate_cost_with_cache(
+                provider, model or f"{provider}/unknown",
+                input_tokens, output_tokens,
+                cache_creation_in, cache_read_in,
+            )
+        else:
+            cost = self.pricing.calculate_cost(
+                provider, model or f"{provider}/unknown",
+                input_tokens, output_tokens,
+            )
+
         self.usage.record_usage(
             provider=provider,
             model=model or f"{provider}/unknown",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation_in,
+            cache_read_input_tokens=cache_read_in,
             latency_ms=elapsed_ms,
             fallback=":fb:" in backend["id"],
+            cost=cost,
         )
 
     @staticmethod
@@ -600,6 +684,12 @@ class GatewayServer:
         })
 
     async def _handle_status(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": {"message": "Unauthorized", "type": "gateway_error"}},
+                status=401,
+            )
+
         info: dict[str, Any] = {}
         for ep_name, ep in self.config.endpoints.items():
             ep_info: dict[str, Any] = {"backends": [], "mode": "passthrough"}
@@ -629,12 +719,20 @@ class GatewayServer:
         model_health = health_summary.pop("model_health", {})
 
         return web.json_response({
+            "mode": self.config.mode,
+            "available_modes": list(self.config.endpoint_modes.keys()),
             "endpoints": info,
             "health_detail": health_summary,
             "model_health": model_health,
         })
 
     async def _handle_usage(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": {"message": "Unauthorized", "type": "gateway_error"}},
+                status=401,
+            )
+
         period = request.query.get("period", "today")
         group_by = request.query.get("group_by", "")
 
@@ -667,15 +765,11 @@ class GatewayServer:
 
     @staticmethod
     def _install_signal_handlers(shutdown_event: asyncio.Event) -> None:
-        """Install SIGTERM/SIGINT handlers for graceful shutdown."""
         loop = asyncio.get_running_loop()
         try:
-            # Unix: register via event loop (works with asyncio)
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, shutdown_event.set)
         except NotImplementedError:
-            # Windows: add_signal_handler not supported
-            # SIGINT is handled via KeyboardInterrupt (caught in run())
             signal.signal(
                 signal.SIGTERM,
                 lambda s, f: loop.call_soon_threadsafe(shutdown_event.set),
@@ -709,6 +803,10 @@ class GatewayServer:
         base = f"http://{self.config.host}:{self.config.port}"
         print()
         print(f"  aistatus gateway running on {base}")
+        if self.config.mode != "default":
+            print(f"  Active mode: {self.config.mode}")
+        if self.config.auth and self.config.auth.enabled:
+            print(f"  Authentication: enabled ({len(self.config.auth.keys)} key(s))")
         print()
         for ep_name, ep in self.config.endpoints.items():
             nk = len(ep.keys)
@@ -732,6 +830,8 @@ class GatewayServer:
         print(f"  Status:  {base}/status")
         print(f"  Health:  {base}/health")
         print(f"  Usage:   {base}/usage?period=today&group_by=model")
+        if len(self.config.endpoint_modes) > 1:
+            print(f"  Modes:   {list(self.config.endpoint_modes.keys())}")
         print()
 
 

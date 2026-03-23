@@ -1,7 +1,3 @@
-# input: gateway.yaml data, env vars, default endpoint presets
-# output: validated GatewayConfig/EndpointConfig objects for the gateway runtime
-# pos: gateway config loader and validator
-# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Gateway configuration: loading, validation, auto-discovery."""
 
 from __future__ import annotations
@@ -10,6 +6,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .auth import GatewayAuthConfig
 
 CONFIG_DIR = Path.home() / ".aistatus"
 CONFIG_FILE = CONFIG_DIR / "gateway.yaml"
@@ -73,25 +71,7 @@ class FallbackConfig:
 
 @dataclass
 class EndpointConfig:
-    """One endpoint group (anthropic / openai / google).
-
-    When ``keys`` are set AND ``passthrough`` is True (the default),
-    the gateway operates in **hybrid** mode: managed keys are tried first,
-    then the caller's own key (forwarded from the incoming request header)
-    is tried as an additional backend before moving on to fallbacks.
-
-    Set ``passthrough: false`` in the config to disable passthrough and
-    use only the managed keys.
-
-    ``model_fallbacks`` maps model names to ordered fallback lists for
-    automatic model-level degradation.  Example::
-
-        model_fallbacks:
-          claude-opus-4-6:
-            - claude-sonnet-4-6
-          claude-sonnet-4-6:
-            - claude-haiku-4-5
-    """
+    """One endpoint group (anthropic / openai / google)."""
 
     name: str
     base_url: str
@@ -109,7 +89,10 @@ class GatewayConfig:
     host: str = "127.0.0.1"
     port: int = 9880
     status_check: bool = True
+    mode: str = "default"
+    auth: GatewayAuthConfig | None = None
     endpoints: dict[str, EndpointConfig] = field(default_factory=dict)
+    endpoint_modes: dict[str, dict[str, EndpointConfig]] = field(default_factory=dict)
 
     # --- loaders ---
 
@@ -158,7 +141,12 @@ class GatewayConfig:
                     )
                 )
 
-        return cls(host=host, port=port, endpoints=endpoints)
+        return cls(
+            host=host,
+            port=port,
+            endpoints=endpoints,
+            endpoint_modes={"default": endpoints},
+        )
 
     # --- private ---
 
@@ -168,44 +156,96 @@ class GatewayConfig:
         port = raw.get("port", 9880)
         status_check = raw.get("status_check", True)
 
-        endpoints: dict[str, EndpointConfig] = {}
-        for ep_name in ("anthropic", "openai", "google"):
-            ep_raw = raw.get(ep_name)
-            if not ep_raw:
-                continue
-
-            keys = _resolve_keys(ep_raw.get("keys", []))
-            auth_style = ep_raw.get("auth_style", ep_name if ep_name in AUTH_STYLES else "bearer")
-            base_url = ep_raw.get("base_url", DEFAULT_BASE_URLS.get(ep_name, ""))
-
-            fallbacks: list[FallbackConfig] = []
-            for fb in ep_raw.get("fallbacks", []):
-                fb_key = _resolve_single(fb.get("key", fb.get("api_key", "")))
-                fallbacks.append(
-                    FallbackConfig(
-                        name=fb.get("name", "fallback"),
-                        base_url=fb["base_url"],
-                        api_key=fb_key,
-                        auth_style=fb.get("auth_style", "bearer"),
-                        model_prefix=fb.get("model_prefix", ""),
-                        model_map=fb.get("model_map", {}),
-                        translate=fb.get("translate"),
-                    )
-                )
-
-            passthrough = ep_raw.get("passthrough", True)
-            model_fallbacks = _parse_model_fallbacks(ep_raw.get("model_fallbacks", {}))
-
-            endpoints[ep_name] = EndpointConfig(
-                name=ep_name, base_url=base_url, auth_style=auth_style,
-                keys=keys, passthrough=bool(passthrough), fallbacks=fallbacks,
-                model_fallbacks=model_fallbacks,
+        # Parse auth block
+        auth: GatewayAuthConfig | None = None
+        raw_auth = raw.get("auth")
+        if isinstance(raw_auth, dict):
+            auth_keys = _resolve_keys(raw_auth.get("keys", []))
+            auth = GatewayAuthConfig(
+                enabled=raw_auth.get("enabled", True) is not False and len(auth_keys) > 0,
+                keys=auth_keys,
+                header=raw_auth.get("header", "authorization"),
+                public_paths=raw_auth.get("public_paths", ["/health"]),
             )
 
-        return cls(host=host, port=port, status_check=status_check, endpoints=endpoints)
+        # Parse endpoint configs — support both flat and mode-aware nested configs
+        endpoint_modes: dict[str, dict[str, EndpointConfig]] = {}
+        discovered_modes: list[str] = []
+
+        for ep_name in ("anthropic", "openai", "google"):
+            ep_raw = raw.get(ep_name)
+            if not ep_raw or not isinstance(ep_raw, dict):
+                continue
+
+            if _is_flat_endpoint_config(ep_raw):
+                # Flat config → assign to "default" mode
+                endpoint_modes.setdefault("default", {})
+                endpoint_modes["default"][ep_name] = _parse_endpoint_config(ep_name, ep_raw)
+            else:
+                # Mode-aware nested config
+                for mode_name, mode_raw in ep_raw.items():
+                    if not isinstance(mode_raw, dict):
+                        continue
+                    endpoint_modes.setdefault(mode_name, {})
+                    endpoint_modes[mode_name][ep_name] = _parse_endpoint_config(ep_name, mode_raw)
+                    if mode_name not in discovered_modes:
+                        discovered_modes.append(mode_name)
+
+        # Determine active mode
+        available_modes = list(endpoint_modes.keys())
+        mode = raw.get("mode") or (discovered_modes[0] if discovered_modes else (available_modes[0] if available_modes else "default"))
+        active_mode = mode if mode in endpoint_modes else (available_modes[0] if available_modes else "default")
+        endpoint_modes.setdefault(active_mode, {})
+
+        return cls(
+            host=host,
+            port=port,
+            status_check=status_check,
+            mode=active_mode,
+            auth=auth,
+            endpoints=endpoint_modes[active_mode],
+            endpoint_modes=endpoint_modes,
+        )
 
 
 # --- helpers ---
+
+def _is_flat_endpoint_config(value: dict) -> bool:
+    """Check if a dict looks like a flat endpoint config (has keys/base_url/etc)."""
+    endpoint_keys = {"keys", "base_url", "auth_style", "passthrough", "fallbacks", "model_fallbacks"}
+    return any(k in value for k in endpoint_keys)
+
+
+def _parse_endpoint_config(ep_name: str, ep_raw: dict[str, Any]) -> EndpointConfig:
+    """Parse a single endpoint config dict into EndpointConfig."""
+    keys = _resolve_keys(ep_raw.get("keys", []))
+    auth_style = ep_raw.get("auth_style", ep_name if ep_name in AUTH_STYLES else "bearer")
+    base_url = ep_raw.get("base_url", DEFAULT_BASE_URLS.get(ep_name, ""))
+
+    fallbacks: list[FallbackConfig] = []
+    for fb in ep_raw.get("fallbacks", []):
+        fb_key = _resolve_single(fb.get("key", fb.get("api_key", "")))
+        fallbacks.append(
+            FallbackConfig(
+                name=fb.get("name", "fallback"),
+                base_url=fb["base_url"],
+                api_key=fb_key,
+                auth_style=fb.get("auth_style", "bearer"),
+                model_prefix=fb.get("model_prefix", ""),
+                model_map=fb.get("model_map", {}),
+                translate=fb.get("translate"),
+            )
+        )
+
+    passthrough = ep_raw.get("passthrough", True)
+    model_fallbacks = _parse_model_fallbacks(ep_raw.get("model_fallbacks", {}))
+
+    return EndpointConfig(
+        name=ep_name, base_url=base_url, auth_style=auth_style,
+        keys=keys, passthrough=bool(passthrough), fallbacks=fallbacks,
+        model_fallbacks=model_fallbacks,
+    )
+
 
 def _parse_model_fallbacks(raw: Any) -> dict[str, list[str]]:
     if raw is None:
@@ -261,6 +301,13 @@ def generate_config() -> str:
 #   python -m aistatus.gateway start --auto
 
 port: 9880
+
+# ── Authentication ─────────────────────────────────────────────
+# auth:
+#   keys:
+#     - $GATEWAY_API_KEY
+#   # header: authorization  # default: Bearer scheme
+#   # public_paths: ["/health"]  # default
 
 # ── Anthropic (for Claude Code) ─────────────────────────────────
 anthropic:
