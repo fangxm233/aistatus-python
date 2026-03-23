@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from ..exceptions import ProviderNotInstalled
+from ..exceptions import ProviderNotConfigured, ProviderNotInstalled
 from ..models import RouteResponse
 from .openai_ import OpenAIAdapter
 from .base import register
@@ -19,39 +19,26 @@ class OpenRouterAdapter(OpenAIAdapter):
         if self.config.api_key:
             return self.config.api_key
         if self.config.env:
-            return os.environ.get(self.config.env)
-        return os.environ.get("OPENROUTER_API_KEY")
+            key = os.environ.get(self.config.env)
+            if key:
+                return key
+            raise ProviderNotConfigured("openrouter", self.config.env)
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if key:
+            return key
+        raise ProviderNotConfigured("openrouter", "OPENROUTER_API_KEY")
 
-    def _get_client(self):
-        try:
-            import openai
-        except ImportError:
-            raise ProviderNotInstalled("openrouter", "openai")
-        
-        # OpenRouter specific initialization
-        return openai.OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=self._get_api_key(),
-            default_headers={
-                "HTTP-Referer": "https://aistatus.cc",
-                "X-Title": "aistatus-sdk",
-            }
-        )
+    def _get_base_url(self) -> str | None:
+        return self.config.base_url or "https://openrouter.ai/api/v1"
 
-    def _get_async_client(self):
-        try:
-            import openai
-        except ImportError:
-            raise ProviderNotInstalled("openrouter", "openai")
-        
-        return openai.AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=self._get_api_key(),
-            default_headers={
-                "HTTP-Referer": "https://aistatus.cc",
-                "X-Title": "aistatus-sdk",
-            }
-        )
+    def _get_default_headers(self) -> dict[str, str]:
+        headers = {
+            "HTTP-Referer": "https://aistatus.cc",
+            "X-Title": "aistatus-sdk",
+        }
+        if self.config.headers:
+            headers.update(self.config.headers)
+        return headers
 
     def _to_response(self, r, model_id: str) -> RouteResponse:
         content = r.choices[0].message.content or ""

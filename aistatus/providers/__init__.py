@@ -6,11 +6,12 @@ from .google_ import GoogleAdapter  # noqa: F401
 from .openrouter_ import OpenRouterAdapter  # noqa: F401
 from .compatible_ import (
     DeepSeekAdapter,
-    MistralAIAdapter,
+    MistralAdapter,
+    MistralAIAdapter,  # backward compat alias
     XAIAdapter,
     GroqAdapter,
     TogetherAdapter,
     MoonshotAIAdapter,
     QwenAdapter,
 )  # noqa: F401
-from .base import create_adapter  # noqa: F401
+from .base import create_adapter, register_adapter_type  # noqa: F401
