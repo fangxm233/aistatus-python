@@ -18,7 +18,7 @@ Tier-based routing (requires configuration)::
     resp = router.route("Hello!", tier="fast")
 """
 
-__version__ = "0.0.2"
+__version__ = "0.0.4"
 
 # Core routing
 from .router import Router  # noqa: F401
@@ -27,11 +27,19 @@ from .router import Router  # noqa: F401
 from .models import (  # noqa: F401
     RouteResponse,
     RouteConfig,
+    RouteOptions,
     CheckResult,
     Status,
     ProviderStatus,
     ProviderConfig,
+    ProviderCallOptions,
     ModelInfo,
+    # Content block types
+    TextBlock,
+    ImageUrlBlock,
+    ImageBase64Block,
+    # Stream chunk types
+    StreamChunk,
 )
 
 # Status API (for direct queries without routing)
@@ -44,8 +52,26 @@ from .exceptions import (  # noqa: F401
     ProviderCallFailed,
     NoBudgetMatch,
     ProviderNotInstalled,
+    ProviderNotConfigured,
     CheckAPIUnreachable,
 )
+
+# Content helpers
+from .content import extract_text_from_content, normalize_content  # noqa: F401
+
+# Middleware types
+from .middleware import Middleware, BeforeRequestContext, AfterResponseContext  # noqa: F401
+
+# Stream helpers
+from .stream import collect_stream_text, stream_to_text_chunks  # noqa: F401
+
+# Provider adapter base + registration
+from .providers.base import ProviderAdapter, register_adapter_type  # noqa: F401
+
+# Usage & pricing
+from .usage import UsageTracker  # noqa: F401
+from .usage_storage import UsageStorage  # noqa: F401
+from .pricing import CostCalculator  # noqa: F401
 
 # Trigger adapter registration on import
 from . import providers as _providers  # noqa: F401
@@ -124,16 +150,42 @@ __all__ = [
     # Models
     "RouteResponse",
     "RouteConfig",
+    "RouteOptions",
     "CheckResult",
     "Status",
     "ProviderStatus",
     "ProviderConfig",
+    "ProviderCallOptions",
     "ModelInfo",
+    # Content block types
+    "TextBlock",
+    "ImageUrlBlock",
+    "ImageBase64Block",
+    # Stream chunks
+    "StreamChunk",
     # Exceptions
     "AIStatusError",
     "AllProvidersDown",
     "ProviderCallFailed",
     "NoBudgetMatch",
     "ProviderNotInstalled",
+    "ProviderNotConfigured",
     "CheckAPIUnreachable",
+    # Content helpers
+    "extract_text_from_content",
+    "normalize_content",
+    # Middleware
+    "Middleware",
+    "BeforeRequestContext",
+    "AfterResponseContext",
+    # Stream helpers
+    "collect_stream_text",
+    "stream_to_text_chunks",
+    # Provider base
+    "ProviderAdapter",
+    "register_adapter_type",
+    # Usage & pricing
+    "UsageTracker",
+    "UsageStorage",
+    "CostCalculator",
 ]
