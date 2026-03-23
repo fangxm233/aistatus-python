@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 
+from ._defaults import extract_provider_slug, normalize_provider_slug
 from .models import Alternative, CheckResult, ModelInfo, ProviderStatus, Status
 
 BASE_URL = "https://aistatus.cc"
@@ -45,16 +46,12 @@ class StatusAPI:
     def providers(self) -> list[ProviderStatus]:
         """All provider statuses.  GET /api/providers"""
         data = self._get("/api/providers")
-        return [
-            ProviderStatus(
-                slug=p["slug"],
-                name=p["name"],
-                status=Status(p["status"]),
-                status_detail=p.get("statusDetail"),
-                model_count=p.get("modelCount", 0),
-            )
-            for p in data.get("providers", [])
-        ]
+        results = []
+        for p in data.get("providers", []):
+            ps = self._parse_provider_status(p)
+            if ps:
+                results.append(ps)
+        return results
 
     def model(self, model_id: str) -> ModelInfo | None:
         """Get single model info.  GET /api/models/:provider/:model"""
@@ -67,7 +64,12 @@ class StatusAPI:
     def search_models(self, query: str) -> list[ModelInfo]:
         """Search models.  GET /api/models?q=..."""
         data = self._get("/api/models", {"q": query})
-        return [self._parse_model(m) for m in data.get("models", [])]
+        results = []
+        for m in data.get("models", []):
+            mi = self._parse_model(m)
+            if mi:
+                results.append(mi)
+        return results
 
     # ---- public methods (async) ----------------------------------------
 
@@ -83,32 +85,151 @@ class StatusAPI:
 
     @staticmethod
     def _parse_check(data: dict) -> CheckResult:
+        model = _as_string(data.get("model"))
+
+        # Provider: try provider, slug, then extract from model
+        provider = normalize_provider_slug(
+            _as_string(data.get("provider"))
+            or _as_string(data.get("slug"))
+            or extract_provider_slug(model)
+            or ""
+        )
+
+        # Status: try status, providerStatus, then available bool
+        status = _parse_status(
+            _as_string(data.get("status"))
+            or _as_string(data.get("providerStatus"))
+            or _available_to_status(data.get("available"))
+        )
+
+        # Status detail: try statusDetail, providerStatusDetail
+        status_detail = (
+            _as_string(data.get("statusDetail"))
+            or _as_string(data.get("providerStatusDetail"))
+        )
+
+        alternatives = [
+            alt for alt in (
+                _parse_alternative(a) for a in data.get("alternatives", [])
+            ) if alt is not None
+        ]
+
         return CheckResult(
-            provider=data.get("provider", data.get("slug", "")),
-            status=Status(data.get("status", "unknown")),
-            status_detail=data.get("statusDetail"),
-            model=data.get("model"),
-            alternatives=[
-                Alternative(
-                    slug=a["slug"],
-                    name=a["name"],
-                    status=Status(a["status"]),
-                    suggested_model=a.get("suggestedModel", ""),
-                )
-                for a in data.get("alternatives", [])
-            ],
+            provider=provider or "",
+            status=status,
+            status_detail=status_detail,
+            model=model,
+            alternatives=alternatives,
         )
 
     @staticmethod
-    def _parse_model(data: dict) -> ModelInfo:
-        pricing = data.get("pricing", {})
-        prov = data.get("provider", {})
-        return ModelInfo(
-            id=data.get("id", ""),
-            name=data.get("name", ""),
-            provider_slug=prov.get("slug", "") if isinstance(prov, dict) else "",
-            context_length=data.get("context_length", 0),
-            modality=data.get("modality", "text->text"),
-            prompt_price=float(pricing.get("prompt", 0)),
-            completion_price=float(pricing.get("completion", 0)),
+    def _parse_provider_status(value: dict) -> ProviderStatus | None:
+        if not isinstance(value, dict):
+            return None
+        return ProviderStatus(
+            slug=normalize_provider_slug(_as_string(value.get("slug")) or ""),
+            name=_as_string(value.get("name")) or _as_string(value.get("slug")) or "",
+            status=_parse_status(_as_string(value.get("status"))),
+            status_detail=_as_string(value.get("statusDetail")),
+            model_count=_as_int(value.get("modelCount")),
         )
+
+    @staticmethod
+    def _parse_model(data: dict) -> ModelInfo | None:
+        if not isinstance(data, dict):
+            return None
+        pricing = data.get("pricing", {})
+        if not isinstance(pricing, dict):
+            pricing = {}
+        prov = data.get("provider", {})
+        if not isinstance(prov, dict):
+            prov = {}
+
+        return ModelInfo(
+            id=_as_string(data.get("id")) or "",
+            name=_as_string(data.get("name")) or "",
+            provider_slug=normalize_provider_slug(
+                _as_string(prov.get("slug"))
+                or extract_provider_slug(_as_string(data.get("id")) or "")
+                or ""
+            ),
+            context_length=_as_int(data.get("context_length")),
+            modality=_as_string(data.get("modality")) or "text->text",
+            prompt_price=_as_float(pricing.get("prompt")),
+            completion_price=_as_float(pricing.get("completion")),
+        )
+
+
+# ---- module-level helpers -----------------------------------------------
+
+def _parse_alternative(value: dict) -> Alternative | None:
+    if not isinstance(value, dict):
+        return None
+
+    suggested_model = (
+        _as_string(value.get("suggestedModel"))
+        or _as_string(value.get("model"))
+        or _as_string(value.get("id"))
+        or ""
+    )
+    slug = normalize_provider_slug(
+        _as_string(value.get("slug"))
+        or _as_string(value.get("provider"))
+        or extract_provider_slug(suggested_model)
+        or ""
+    )
+
+    return Alternative(
+        slug=slug,
+        name=_as_string(value.get("name")) or slug,
+        status=_parse_status(
+            _as_string(value.get("status"))
+            or _as_string(value.get("providerStatus"))
+            or _available_to_status(value.get("available"))
+        ),
+        suggested_model=suggested_model,
+    )
+
+
+def _available_to_status(value) -> str | None:
+    if value is True:
+        return Status.OPERATIONAL.value
+    if value is False:
+        return Status.DOWN.value
+    return None
+
+
+def _parse_status(value: str | None) -> Status:
+    if value == Status.OPERATIONAL.value:
+        return Status.OPERATIONAL
+    if value == Status.DEGRADED.value:
+        return Status.DEGRADED
+    if value == Status.DOWN.value:
+        return Status.DOWN
+    return Status.UNKNOWN
+
+
+def _as_string(value) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _as_int(value) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
+def _as_float(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            pass
+    return 0.0

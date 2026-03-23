@@ -1,7 +1,4 @@
-# input: aistatus.cc model search API, cached pricing records, provider/model identifiers
-# output: per-model pricing lookup and USD cost estimates for usage tracking
-# pos: SDK pricing normalization and lookup layer shared by UsageTracker
-# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+"""Pricing lookup and cost estimation for usage tracking."""
 
 from __future__ import annotations
 
@@ -37,6 +34,41 @@ class CostCalculator:
         cost = 0.0
         if input_per_million is not None:
             cost += (max(input_tokens, 0) / 1_000_000) * input_per_million
+        if output_per_million is not None:
+            cost += (max(output_tokens, 0) / 1_000_000) * output_per_million
+        return round(cost, 8)
+
+    def calculate_cost_with_cache(
+        self,
+        provider: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_creation_input_tokens: int,
+        cache_read_input_tokens: int,
+    ) -> float:
+        """Calculate cost including prompt cache tokens."""
+        pricing = self.get_pricing(provider, model)
+        if not pricing:
+            return 0.0
+
+        input_per_million = pricing.get("input_per_million")
+        output_per_million = pricing.get("output_per_million")
+        cache_read_per_million = pricing.get("input_cache_read_per_million")
+        cache_write_per_million = pricing.get("input_cache_write_per_million")
+
+        if input_per_million is None and output_per_million is None:
+            return 0.0
+
+        cost = 0.0
+        if input_per_million is not None:
+            cost += (max(input_tokens, 0) / 1_000_000) * input_per_million
+            # Cache creation: use fetched price, fallback to 1.25x input price
+            write_price = cache_write_per_million if cache_write_per_million is not None else (input_per_million * 1.25)
+            cost += (max(cache_creation_input_tokens, 0) / 1_000_000) * write_price
+            # Cache read: use fetched price, fallback to 0.10x input price
+            read_price = cache_read_per_million if cache_read_per_million is not None else (input_per_million * 0.10)
+            cost += (max(cache_read_input_tokens, 0) / 1_000_000) * read_price
         if output_per_million is not None:
             cost += (max(output_tokens, 0) / 1_000_000) * output_per_million
         return round(cost, 8)
@@ -95,9 +127,14 @@ class CostCalculator:
         if prompt is None and completion is None:
             return None
 
+        cache_read = self._to_float(pricing.get("input_cache_read"))
+        cache_write = self._to_float(pricing.get("input_cache_write"))
+
         return {
             "input_per_million": None if prompt is None else prompt * 1_000_000,
             "output_per_million": None if completion is None else completion * 1_000_000,
+            "input_cache_read_per_million": None if cache_read is None else cache_read * 1_000_000,
+            "input_cache_write_per_million": None if cache_write is None else cache_write * 1_000_000,
         }
 
     def _pick_model_match(self, provider: str, model: str, models: list[dict[str, Any]]) -> dict[str, Any] | None:

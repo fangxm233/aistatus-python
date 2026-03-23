@@ -19,8 +19,23 @@ class UsageTracker:
         self.cost_calculator = cost_calculator or CostCalculator()
 
     def calculate_cost(self, response: RouteResponse) -> float:
+        if response.cost_usd:
+            return round(response.cost_usd, 8)
+        # Use cache-aware cost if cache tokens are present
+        if response.cache_creation_input_tokens or response.cache_read_input_tokens:
+            return round(
+                self.cost_calculator.calculate_cost_with_cache(
+                    provider=response.provider_used,
+                    model=response.model_used,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    cache_creation_input_tokens=response.cache_creation_input_tokens,
+                    cache_read_input_tokens=response.cache_read_input_tokens,
+                ),
+                8,
+            )
         return round(
-            response.cost_usd or self.cost_calculator.calculate_cost(
+            self.cost_calculator.calculate_cost(
                 provider=response.provider_used,
                 model=response.model_used,
                 input_tokens=response.input_tokens,
@@ -33,7 +48,7 @@ class UsageTracker:
         provider = response.provider_used
         model = response.model_used
         cost = self.calculate_cost(response)
-        record = {
+        record: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "provider": provider,
             "model": model,
@@ -43,6 +58,10 @@ class UsageTracker:
             "fallback": response.was_fallback,
             "latency_ms": latency_ms,
         }
+        if response.cache_creation_input_tokens:
+            record["cache_creation_in"] = response.cache_creation_input_tokens
+        if response.cache_read_input_tokens:
+            record["cache_read_in"] = response.cache_read_input_tokens
         self.storage.append(record)
         return record
 
@@ -53,14 +72,23 @@ class UsageTracker:
         model: str,
         input_tokens: int,
         output_tokens: int,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
         latency_ms: int,
         fallback: bool,
         cost: float | None = None,
+        billing_mode: str | None = None,
     ) -> dict[str, Any]:
         record_cost = cost
         if record_cost is None:
-            record_cost = self.cost_calculator.calculate_cost(provider, model, input_tokens, output_tokens)
-        record = {
+            if cache_creation_input_tokens or cache_read_input_tokens:
+                record_cost = self.cost_calculator.calculate_cost_with_cache(
+                    provider, model, input_tokens, output_tokens,
+                    cache_creation_input_tokens, cache_read_input_tokens,
+                )
+            else:
+                record_cost = self.cost_calculator.calculate_cost(provider, model, input_tokens, output_tokens)
+        record: dict[str, Any] = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "provider": provider,
             "model": model,
@@ -70,6 +98,12 @@ class UsageTracker:
             "fallback": fallback,
             "latency_ms": latency_ms,
         }
+        if billing_mode:
+            record["billing_mode"] = billing_mode
+        if cache_creation_input_tokens:
+            record["cache_creation_in"] = cache_creation_input_tokens
+        if cache_read_input_tokens:
+            record["cache_read_in"] = cache_read_input_tokens
         self.storage.append(record)
         return record
 
