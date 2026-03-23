@@ -48,6 +48,18 @@ class ProviderNotInstalled(AIStatusError):
         )
 
 
+class ProviderNotConfigured(AIStatusError):
+    """Raised when a provider's API key is not configured."""
+
+    def __init__(self, provider: str, env_name: str | None = None):
+        self.provider = provider
+        self.env_name = env_name
+        msg = f"Provider '{provider}' is not configured."
+        if env_name:
+            msg += f" Set the {env_name} environment variable."
+        super().__init__(msg)
+
+
 class CheckAPIUnreachable(AIStatusError):
     """Raised when aistatus.cc API itself is unreachable."""
 
