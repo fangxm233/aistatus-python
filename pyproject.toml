@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aistatus"
-version = "0.0.2"
+version = "0.0.3"
 description = "Status-aware LLM routing with pre-flight checks and auto-fallback for more reliable agents and coding CLIs."
 readme = "README.md"
 license = "MIT"
