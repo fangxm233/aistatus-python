@@ -14,7 +14,7 @@ Model-level and backend-level health are independent. A model-specific error
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -50,8 +50,8 @@ class HealthTracker:
     """
 
     def __init__(self):
-        self._state: dict[str, _BackendState] = defaultdict(_BackendState)
-        self._model_state: dict[tuple[str, str], _BackendState] = defaultdict(_BackendState)
+        self._state: dict[str, _BackendState] = {}
+        self._model_state: dict[tuple[str, str], _BackendState] = {}
 
     def is_healthy(self, backend_id: str, *, model: str | None = None) -> bool:
         s = self._get_state(backend_id, model)
@@ -126,5 +126,5 @@ class HealthTracker:
     def _get_state(self, backend_id: str, model: str | None) -> _BackendState:
         """Return the appropriate state object for the given layer."""
         if model is not None:
-            return self._model_state[(backend_id, model)]
-        return self._state[backend_id]
+            return self._model_state.setdefault((backend_id, model), _BackendState())
+        return self._state.setdefault(backend_id, _BackendState())
