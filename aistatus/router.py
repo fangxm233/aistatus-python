@@ -742,12 +742,25 @@ class Router:
             candidate.provider_slug != first.provider_slug
             or candidate.model_id != first.model_id
         )
-        cost_usd = self.usage.cost_calculator.calculate_cost(
-            provider=candidate.provider_slug,
-            model=used,
-            input_tokens=resp.input_tokens,
-            output_tokens=resp.output_tokens,
-        ) if self.usage is not None else resp.cost_usd
+        if self.usage is not None:
+            if resp.cache_creation_input_tokens or resp.cache_read_input_tokens:
+                cost_usd = self.usage.cost_calculator.calculate_cost_with_cache(
+                    provider=candidate.provider_slug,
+                    model=used,
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                    cache_creation_input_tokens=resp.cache_creation_input_tokens,
+                    cache_read_input_tokens=resp.cache_read_input_tokens,
+                )
+            else:
+                cost_usd = self.usage.cost_calculator.calculate_cost(
+                    provider=candidate.provider_slug,
+                    model=used,
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                )
+        else:
+            cost_usd = resp.cost_usd
         return RouteResponse(
             content=resp.content,
             model_used=used,
