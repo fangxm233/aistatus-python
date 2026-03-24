@@ -195,6 +195,15 @@ async def openai_sse_to_anthropic_sse(
                     yield _sse("message_stop", {"type": "message_stop"})
                     return
 
+    # Stream ended without [DONE] or finish_reason — emit terminal events
+    yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+    yield _sse("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })
+    yield _sse("message_stop", {"type": "message_stop"})
+
 
 def _sse(event: str, data: dict) -> bytes:
     """Format a single SSE event."""
