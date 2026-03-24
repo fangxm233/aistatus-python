@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 from dataclasses import dataclass, field
 
 
@@ -53,4 +54,4 @@ def check_gateway_auth(
         return False
 
     # Check against configured keys
-    return any(key == provided_key for key in auth_config.keys)
+    return any(hmac.compare_digest(key, provided_key) for key in auth_config.keys)
