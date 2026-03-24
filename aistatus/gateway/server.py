@@ -440,10 +440,11 @@ class GatewayServer:
                 async for chunk in upstream.content.iter_any():
                     yield chunk
 
-            async for translated in openai_sse_to_anthropic_sse(_chunks(), original_model):
-                await resp.write(translated)
-
-            upstream.release()
+            try:
+                async for translated in openai_sse_to_anthropic_sse(_chunks(), original_model):
+                    await resp.write(translated)
+            finally:
+                upstream.release()
             return resp
         else:
             resp = web.StreamResponse()
@@ -458,10 +459,11 @@ class GatewayServer:
                     resp.headers[h] = upstream.headers[h]
             await resp.prepare(request)
 
-            async for chunk in upstream.content.iter_any():
-                await resp.write(chunk)
-
-            upstream.release()
+            try:
+                async for chunk in upstream.content.iter_any():
+                    await resp.write(chunk)
+            finally:
+                upstream.release()
             return resp
 
     # ------------------------------------------------------------------
@@ -505,7 +507,8 @@ class GatewayServer:
 
         for endpoint in self.config.endpoints.values():
             endpoint_models = set(endpoint.model_fallbacks.keys())
-            endpoint_models.update(*(candidate for candidates in endpoint.model_fallbacks.values() for candidate in candidates))
+            for candidates in endpoint.model_fallbacks.values():
+                endpoint_models.update(candidates)
             unhealthy_models = endpoint_models & degraded_models
             if not unhealthy_models:
                 continue

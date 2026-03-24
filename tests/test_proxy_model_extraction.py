@@ -106,7 +106,13 @@ class TestModelHealthOnSuccess:
 
         with patch("aistatus.gateway.server.StatusAPI", create=True) as mock_status_api:
             mock_client = MagicMock()
-            mock_client.acheck_model = AsyncMock(return_value=MagicMock(status="degraded"))
+
+            async def _selective_check(model):
+                if model == "claude-opus-4-6":
+                    return MagicMock(status="degraded")
+                return MagicMock(status="operational")
+
+            mock_client.acheck_model = _selective_check
             mock_status_api.return_value = mock_client
 
             await server._apply_global_model_health_precheck()
