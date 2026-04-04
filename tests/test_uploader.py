@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 
-from aistatus import AIStatusConfig, configure, get_config
+from aistatus import AIStatusConfig, __version__, configure, get_config
 from aistatus.config import AIStatusConfig as ConfigAIStatusConfig
 from aistatus.router import Router
 from aistatus.uploader import UsageUploader
@@ -102,7 +102,7 @@ class TestUsageUploader:
         assert thread.daemon is True
         assert thread.started is True
         payload = thread.args[0]
-        assert payload["sdk_version"] == "0.0.3"
+        assert payload["sdk_version"] == __version__
         assert payload["records"] == [{
             "ts": "2026-04-03T00:00:00+00:00",
             "name": "Alice",
@@ -188,7 +188,7 @@ class TestUsageUploader:
             lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
         )
 
-        uploader._post({"records": [], "sdk_version": "0.0.3"})
+        uploader._post({"records": [], "sdk_version": __version__})
 
     def test_post_targets_usage_upload_endpoint(self, monkeypatch):
         captured = {}
@@ -210,7 +210,7 @@ class TestUsageUploader:
             return None
 
         monkeypatch.setattr("aistatus.uploader.urllib.request.urlopen", fake_urlopen)
-        payload = {"records": [{"email": "alice@example.com"}], "sdk_version": "0.0.3"}
+        payload = {"records": [{"email": "alice@example.com"}], "sdk_version": __version__}
 
         uploader._post(payload)
 

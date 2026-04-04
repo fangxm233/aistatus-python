@@ -1,5 +1,5 @@
-# input: package imports plus optional provider SDKs discovered by router/provider modules
-# output: public aistatus SDK API exports including routing, pricing, usage, and upload config helpers
+# input: package imports plus optional provider SDKs, persisted upload config, and usage uploader discovered by router/provider modules
+# output: public aistatus SDK API exports including routing, pricing, usage, uploader, and upload config helpers
 # pos: package root that defines the stable Python SDK import surface
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
@@ -23,7 +23,7 @@ Tier-based routing (requires configuration)::
     resp = router.route("Hello!", tier="fast")
 """
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 # Core routing
 from .router import Router  # noqa: F401

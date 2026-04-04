@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.0.4 — 2026-04-04
+
+### Python SDK
+
+Release prep for the opt-in usage upload and leaderboard flow.
+
+- **Persistent upload config** — add `AIStatusConfig`, `configure()`, and `get_config()` with `~/.aistatus/config.yaml` persistence for upload identity and opt-in state
+- **Fire-and-forget uploader** — add `UsageUploader` and wire `UsageTracker`, `Router`, and `GatewayServer` to asynchronously POST usage records to `aistatus.cc/api/usage/upload` with silent failure semantics
+- **Leaderboard support** — include uploader payload fields and public exports needed for the hosted usage leaderboard backend and UI
+
 ## 0.0.3 — 2026-03-23
 
 ### Gateway
