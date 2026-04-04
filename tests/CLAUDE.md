@@ -13,3 +13,4 @@ Tests are written to validate gateway features before implementation changes.
 | `test_model_health.py` | regression | Verify `HealthTracker` backend/model dual-layer behavior |
 | `test_graceful_shutdown.py` | regression | Verify signal handling and PID cleanup |
 | `test_config.py` | regression | Verify SDK upload config defaults, file/env precedence, and configure() persistence |
+| `test_uploader.py` | regression | Verify fire-and-forget usage uploader gating, payload mapping, and silent exception handling |
