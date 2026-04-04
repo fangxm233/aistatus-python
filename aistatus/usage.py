@@ -1,12 +1,21 @@
+# input: route responses, optional usage uploader, pricing lookup, and usage storage backend
+# output: persisted usage records, aggregated usage summaries, and optional async upload fan-out
+# pos: central usage tracking layer shared by router and gateway request flows
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 
 from .models import RouteResponse
 from .pricing import CostCalculator
 from .usage_storage import UsageStorage
+
+
+class UsageUploadSink(Protocol):
+    def upload(self, record: dict[str, Any]) -> None: ...
 
 
 class UsageTracker:
@@ -14,9 +23,11 @@ class UsageTracker:
         self,
         storage: UsageStorage | None = None,
         cost_calculator: CostCalculator | None = None,
+        uploader: UsageUploadSink | None = None,
     ):
         self.storage = storage or UsageStorage()
         self.cost_calculator = cost_calculator or CostCalculator()
+        self.uploader = uploader
 
     def calculate_cost(self, response: RouteResponse) -> float:
         if response.cost_usd:
@@ -63,6 +74,7 @@ class UsageTracker:
         if response.cache_read_input_tokens:
             record["cache_read_in"] = response.cache_read_input_tokens
         self.storage.append(record)
+        self._upload(record)
         return record
 
     def record_usage(
@@ -105,6 +117,7 @@ class UsageTracker:
         if cache_read_input_tokens:
             record["cache_read_in"] = cache_read_input_tokens
         self.storage.append(record)
+        self._upload(record)
         return record
 
     def summary(self, period: str = "month", all_projects: bool = False) -> dict[str, Any]:
@@ -183,3 +196,7 @@ class UsageTracker:
             rows.append(bucket)
         rows.sort(key=lambda row: (-row["cost_usd"], row[key]))
         return rows
+
+    def _upload(self, record: dict[str, Any]) -> None:
+        if self.uploader is not None:
+            self.uploader.upload(record)

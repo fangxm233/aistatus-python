@@ -1,6 +1,6 @@
-# input: gateway endpoint configs, mocked requests, and health state
-# output: regression coverage for backend ordering, config parsing, and status data
-# pos: gateway backend selection and config-loading test suite
+# input: gateway endpoint configs, mocked requests, health state, and upload config wiring
+# output: regression coverage for backend ordering, config parsing, status data, and gateway usage uploader wiring
+# pos: gateway backend selection, config-loading, and usage integration test suite
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Tests for hybrid backend selection in the gateway.
 
@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from aistatus.config import AIStatusConfig
 from aistatus.gateway.config import EndpointConfig, FallbackConfig, GatewayConfig
 from aistatus.gateway.health import HealthTracker
 from aistatus.gateway.server import GatewayServer
@@ -177,6 +178,28 @@ class TestHybridBackendSelection:
         # Managed key is unhealthy, only passthrough should remain
         assert len(backends) == 1
         assert backends[0]["id"] == "openai:passthrough"
+
+    def test_gateway_creates_usage_uploader_from_config(self, monkeypatch):
+        config = AIStatusConfig(upload_enabled=True, name="Alice", email="alice@example.com")
+        uploader_instances = []
+
+        class StubUploader:
+            def __init__(self, passed_config):
+                uploader_instances.append(passed_config)
+
+        monkeypatch.setattr("aistatus.gateway.server.get_config", lambda: config)
+        monkeypatch.setattr("aistatus.gateway.server.UsageUploader", StubUploader)
+
+        server = _make_server(
+            EndpointConfig(
+                name="anthropic",
+                base_url="https://api.anthropic.com",
+                auth_style="anthropic",
+            )
+        )
+
+        assert uploader_instances == [config]
+        assert isinstance(server.usage.uploader, StubUploader)
 
 
 # -----------------------------------------------------------------------

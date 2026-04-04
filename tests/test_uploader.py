@@ -1,14 +1,17 @@
-# input: pytest fixtures plus monkeypatched threading and urllib request behavior
-# output: regression tests for fire-and-forget usage upload payload construction and silent failure
-# pos: verifies aistatus.uploader async upload gating, payload mapping, and exception swallowing
+# input: pytest fixtures plus monkeypatched threading, package imports, and usage/router/gateway integration points
+# output: regression tests for fire-and-forget usage upload payload construction and uploader wiring
+# pos: verifies aistatus.uploader async upload gating plus SDK integration with usage tracker, router, gateway, and exports
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 from __future__ import annotations
 
 import json
 
-from aistatus.config import AIStatusConfig
+from aistatus import AIStatusConfig, configure, get_config
+from aistatus.config import AIStatusConfig as ConfigAIStatusConfig
+from aistatus.router import Router
 from aistatus.uploader import UsageUploader
+from aistatus.usage import UsageTracker
 
 
 class DummyThread:
@@ -30,6 +33,22 @@ class ThreadFactory:
         thread = DummyThread(target=target, args=args, daemon=daemon)
         self.instances.append(thread)
         return thread
+
+
+class DummyStorage:
+    def __init__(self):
+        self.records: list[dict] = []
+
+    def append(self, record):
+        self.records.append(record)
+
+
+class DummyUploader:
+    def __init__(self):
+        self.records: list[dict] = []
+
+    def upload(self, record):
+        self.records.append(record)
 
 
 class TestUsageUploader:
@@ -98,6 +117,67 @@ class TestUsageUploader:
             "cost_usd": 0.25,
             "latency_ms": 321,
         }]
+
+    def test_usage_tracker_uploads_after_record(self):
+        storage = DummyStorage()
+        uploader = DummyUploader()
+        tracker = UsageTracker(storage=storage, uploader=uploader)
+
+        record = tracker.record(
+            type("Response", (), {
+                "provider_used": "anthropic",
+                "model_used": "anthropic/claude-sonnet-4-6",
+                "input_tokens": 123,
+                "output_tokens": 45,
+                "cost_usd": 0.25,
+                "was_fallback": False,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            })(),
+            latency_ms=321,
+        )
+
+        assert storage.records == [record]
+        assert uploader.records == [record]
+
+    def test_usage_tracker_uploads_after_record_usage(self):
+        storage = DummyStorage()
+        uploader = DummyUploader()
+        tracker = UsageTracker(storage=storage, uploader=uploader)
+
+        record = tracker.record_usage(
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            input_tokens=123,
+            output_tokens=45,
+            latency_ms=321,
+            fallback=False,
+        )
+
+        assert storage.records == [record]
+        assert uploader.records == [record]
+
+    def test_router_creates_usage_uploader_from_config(self, monkeypatch):
+        config = AIStatusConfig(upload_enabled=True, name="Alice", email="alice@example.com")
+        uploader_instances = []
+
+        class StubUploader:
+            def __init__(self, passed_config):
+                uploader_instances.append(passed_config)
+
+        monkeypatch.setattr("aistatus.router.get_config", lambda: config)
+        monkeypatch.setattr("aistatus.router.UsageUploader", StubUploader)
+
+        router = Router(auto_discover=False)
+
+        assert uploader_instances == [config]
+        assert isinstance(router.usage, UsageTracker)
+        assert isinstance(router.usage.uploader, StubUploader)
+
+    def test_package_exports_config_symbols(self):
+        assert AIStatusConfig is ConfigAIStatusConfig
+        assert callable(configure)
+        assert callable(get_config)
 
     def test_post_swallows_exceptions(self, monkeypatch):
         uploader = UsageUploader(

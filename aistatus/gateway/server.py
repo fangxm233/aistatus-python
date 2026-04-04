@@ -1,3 +1,8 @@
+# input: gateway config, auth rules, aiohttp upstream requests, pricing, and upload config/uploader helpers
+# output: local gateway HTTP endpoints, proxied upstream responses, usage accounting, and optional usage upload
+# pos: SDK gateway runtime that fronts upstream providers with health/fallback and usage collection
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 """Gateway HTTP server — transparent proxy with failover and key rotation."""
 
 from __future__ import annotations
@@ -17,7 +22,9 @@ from aiohttp import web
 from ..api import StatusAPI
 from ..models import Status
 from ..pricing import CostCalculator
+from ..uploader import UsageUploader
 from ..usage import UsageTracker
+from ..config import get_config
 from .auth import check_gateway_auth
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
@@ -29,7 +36,7 @@ class GatewayServer:
     def __init__(self, config: GatewayConfig, pid_file: str | None = None):
         self.config = config
         self.health = HealthTracker()
-        self.usage = UsageTracker()
+        self.usage = UsageTracker(uploader=UsageUploader(get_config()))
         self.pricing = CostCalculator()
         self._session: aiohttp.ClientSession | None = None
         self._key_idx: dict[str, int] = {}  # round-robin counters

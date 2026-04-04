@@ -11,5 +11,5 @@ Shared by the SDK gateway runtime without Cortex-specific logic.
 | `auth.py` | auth | GatewayAuthConfig dataclass and check_gateway_auth validation |
 | `config.py` | config | Load and validate gateway.yaml, endpoints, auth, mode-aware configs, and model fallbacks |
 | `health.py` | health | Track backend/model health with cooldown windows |
-| `server.py` | proxy | Serve `/health` `/status` `/usage`, pre-mark globally degraded models, and proxy upstream requests |
+| `server.py` | proxy | Serve `/health` `/status` `/usage`, pre-mark globally degraded models, proxy upstream requests, and upload usage records |
 | `translate.py` | protocol | Translate Anthropic/OpenAI request and SSE formats when needed |

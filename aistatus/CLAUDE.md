@@ -18,8 +18,8 @@ Public imports are exposed from `__init__.py`, while internal modules implement 
 | `pricing.py` | pricing lookup | Resolve model pricing and estimate token costs |
 | `config.py` | upload config | Persist and resolve SDK upload identity/config from runtime, env, and file sources |
 | `uploader.py` | upload bridge | Build usage upload payloads and POST them asynchronously with silent failure semantics |
-| `router.py` | routing engine | Route requests across providers with fallback logic |
-| `usage.py` | usage tracker | Record request usage and aggregate summaries |
+| `router.py` | routing engine | Route requests across providers with fallback logic and config-backed usage upload |
+| `usage.py` | usage tracker | Record request usage, aggregate summaries, and fan out records to the uploader |
 | `usage_storage.py` | persistence | Store and read usage records on disk |
 | `cli/` | CLI package | Subcommands and command-line integration |
 | `providers/` | provider adapters | Integrate Anthropic, OpenAI, Google, and other backends |

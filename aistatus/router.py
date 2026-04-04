@@ -1,4 +1,7 @@
-"""Core routing engine with auto-discovery and model-based resolution."""
+# input: status API lookups, provider adapters, middleware, gateway health, and upload config/uploader helpers
+# output: routed model responses with fallback handling, usage tracking, and optional usage upload
+# pos: core SDK router that resolves models, executes provider calls, and coordinates per-request bookkeeping
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 from __future__ import annotations
 
@@ -31,7 +34,9 @@ from .models import (
     StreamChunk,
 )
 from .providers.base import ProviderAdapter, create_adapter
+from .uploader import UsageUploader
 from .usage import UsageTracker
+from .config import get_config
 
 log = logging.getLogger("aistatus")
 
@@ -98,7 +103,7 @@ class Router:
         self.adapters: dict[str, ProviderAdapter] = {}
         self._adapter_index: dict[str, str] = {}  # alias → adapter key
         self._tiers: dict[str, list[str]] = {}
-        self.usage = UsageTracker() if track_usage else None
+        self.usage = UsageTracker(uploader=UsageUploader(get_config())) if track_usage else None
         self.health: HealthTracker | None = HealthTracker() if health_tracking else None
         self._middleware: list[Any] = list(middleware or [])
 
