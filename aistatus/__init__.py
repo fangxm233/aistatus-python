@@ -1,3 +1,8 @@
+# input: package imports plus optional provider SDKs discovered by router/provider modules
+# output: public aistatus SDK API exports including routing, pricing, usage, and upload config helpers
+# pos: package root that defines the stable Python SDK import surface
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 """aistatus — Smart AI model routing with real-time status awareness.
 
 Quickstart::
@@ -72,6 +77,7 @@ from .providers.base import ProviderAdapter, register_adapter_type  # noqa: F401
 from .usage import UsageTracker  # noqa: F401
 from .usage_storage import UsageStorage  # noqa: F401
 from .pricing import CostCalculator  # noqa: F401
+from .config import AIStatusConfig, configure, get_config  # noqa: F401
 
 # Trigger adapter registration on import
 from . import providers as _providers  # noqa: F401
@@ -188,4 +194,7 @@ __all__ = [
     "UsageTracker",
     "UsageStorage",
     "CostCalculator",
+    "AIStatusConfig",
+    "configure",
+    "get_config",
 ]

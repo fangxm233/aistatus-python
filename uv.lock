@@ -146,10 +146,11 @@ wheels = [
 
 [[package]]
 name = "aistatus"
-version = "0.0.2"
+version = "0.0.3"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
+    { name = "pyyaml" },
 ]
 
 [package.optional-dependencies]
@@ -189,6 +190,7 @@ requires-dist = [
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.50" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "pyyaml", marker = "extra == 'gateway'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
 ]

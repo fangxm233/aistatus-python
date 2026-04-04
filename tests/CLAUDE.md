@@ -12,3 +12,4 @@ Tests are written to validate gateway features before implementation changes.
 | `test_pricing.py` | regression | Verify pricing lookup handles versioned Claude model IDs and base aliases |
 | `test_model_health.py` | regression | Verify `HealthTracker` backend/model dual-layer behavior |
 | `test_graceful_shutdown.py` | regression | Verify signal handling and PID cleanup |
+| `test_config.py` | regression | Verify SDK upload config defaults, file/env precedence, and configure() persistence |
