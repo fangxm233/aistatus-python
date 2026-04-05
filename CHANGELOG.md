@@ -2,13 +2,157 @@
 
 ## 0.0.4 — 2026-04-04
 
-### Python SDK
+Opt-in usage upload pipeline and cache-aware pricing for the leaderboard flow.
 
-Release prep for the opt-in usage upload and leaderboard flow.
+### New Modules
 
-- **Persistent upload config** — add `AIStatusConfig`, `configure()`, and `get_config()` with `~/.aistatus/config.yaml` persistence for upload identity and opt-in state
-- **Fire-and-forget uploader** — add `UsageUploader` and wire `UsageTracker`, `Router`, and `GatewayServer` to asynchronously POST usage records to `aistatus.cc/api/usage/upload` with silent failure semantics
-- **Leaderboard support** — include uploader payload fields and public exports needed for the hosted usage leaderboard backend and UI
+#### `aistatus.config` — persistent upload configuration
+
+Manages SDK-wide upload identity, backed by `~/.aistatus/config.yaml`.
+
+- **`AIStatusConfig` dataclass** — five fields:
+  - `upload_enabled: bool = False` — master switch for usage uploads
+  - `name: str = ""` — user or organization display name
+  - `organization: str = ""` — organization identifier
+  - `email: str = ""` — contact email for the upload identity
+  - `base_url: str = "https://aistatus.cc"` — upload API endpoint
+- **`get_config() → AIStatusConfig`** — returns a lazy-loaded singleton;
+  thread-safe via double-checked locking (`threading.Lock`).
+  On first call: loads `~/.aistatus/config.yaml` (YAML `upload:` section),
+  then overlays environment variables. Subsequent calls return the cached
+  instance.
+- **`configure(*, upload, name, organization, email) → AIStatusConfig`** —
+  mutates the singleton in-memory, then persists the entire config back to
+  `~/.aistatus/config.yaml` via `yaml.safe_dump`. Returns the updated config.
+- **Config precedence**: `configure()` overrides > env vars > YAML file > defaults
+- **Environment variables**:
+  | Variable | Maps to | Type |
+  |---|---|---|
+  | `AISTATUS_UPLOAD` | `upload_enabled` | bool (`1/true/yes/on`) |
+  | `AISTATUS_NAME` | `name` | str |
+  | `AISTATUS_ORG` | `organization` | str |
+  | `AISTATUS_EMAIL` | `email` | str |
+
+#### `aistatus.uploader` — fire-and-forget usage upload
+
+Bridges local usage tracking to the remote leaderboard API.
+
+- **`UsageUploader` class**:
+  - Constructor takes `AIStatusConfig`; reads `config.base_url` for the
+    endpoint.
+  - **Shared thread pool**: class-level `ThreadPoolExecutor(max_workers=2,
+    thread_name_prefix="aistatus-upload")`, initialized once via
+    double-checked locking. Registered for `atexit` shutdown with
+    `wait=False` so it never blocks interpreter exit.
+  - **`upload(record: dict)`** — the only public method:
+    1. Guards: skips if `upload_enabled` is `False` or if `name`/`email`
+       are empty
+    2. Builds a sanitized payload:
+       - Maps short keys to full names: `in` → `input_tokens`,
+         `out` → `output_tokens`, `cache_creation_in` →
+         `cache_creation_input_tokens`, `cache_read_in` →
+         `cache_read_input_tokens`
+       - Truncates `name` (200 chars), `organization` (200), `email` (254)
+       - Includes `sdk_version` (package `__version__`)
+    3. Submits `_post(payload)` to the shared executor — fire-and-forget,
+       never awaits
+  - **`_post(payload)`** — `urllib.request.urlopen` POST to
+    `{base_url}/api/usage/upload` with `Content-Type: application/json`,
+    5-second timeout. Catches all exceptions silently.
+- **`UsageUploadSink` Protocol** (in `usage.py`) — structural typing
+  interface (`upload(record: dict) → None`) so `UsageTracker` doesn't
+  depend directly on `UsageUploader`.
+
+### Enhanced
+
+#### Usage tracking pipeline
+
+- **`UsageTracker.__init__`** — new optional `uploader: UsageUploadSink | None`
+  parameter. When set, both `record()` and `record_usage()` forward every
+  usage record to `uploader.upload()` after persisting to local storage.
+- **`UsageTracker.record()`** — now includes conditional `cache_creation_in`
+  and `cache_read_in` keys in the record dict when the response carries
+  non-zero cache tokens.
+- **`UsageTracker.record_usage()`** — new keyword args:
+  `cache_creation_input_tokens: int = 0`,
+  `cache_read_input_tokens: int = 0`, `billing_mode: str | None`. Same
+  conditional inclusion and upload fan-out.
+- **`UsageTracker.calculate_cost()`** — automatically routes to
+  `calculate_cost_with_cache()` when the response has non-zero cache
+  tokens; falls back to the basic `calculate_cost()` otherwise.
+
+#### Router & Gateway wiring
+
+- **`Router.__init__`** — when `track_usage=True`, constructs:
+  ```python
+  UsageTracker(uploader=UsageUploader(get_config()))
+  ```
+  All routed requests (sync and streaming) now feed the upload pipeline
+  automatically with zero caller effort.
+- **`GatewayServer.__init__`** — same pattern:
+  ```python
+  self.usage = UsageTracker(uploader=UsageUploader(get_config()))
+  ```
+  Both `_record_stream_usage()` and `_record_usage_if_possible()` now
+  capture and forward cache token fields.
+
+#### Data model additions
+
+- **`RouteResponse`** — two new frozen dataclass fields:
+  - `cache_creation_input_tokens: int = 0`
+  - `cache_read_input_tokens: int = 0`
+
+  Backward-compatible (both default to 0).
+
+- **`StreamUsageChunk`** (TypedDict) — already had optional
+  `cache_creation_input_tokens` and `cache_read_input_tokens` keys;
+  these are now propagated through to `RouteResponse` and usage records.
+
+#### Cache-aware pricing
+
+- **`CostCalculator.calculate_cost_with_cache()`** — new method:
+  ```python
+  def calculate_cost_with_cache(
+      self, provider, model,
+      input_tokens, output_tokens,
+      cache_creation_input_tokens,
+      cache_read_input_tokens,
+  ) -> float
+  ```
+  Cost formula:
+  - Base input: `input_tokens × input_per_million`
+  - Cache creation: `cache_creation_input_tokens × write_price`
+    (fetched from API; fallback **1.25×** input price)
+  - Cache read: `cache_read_input_tokens × read_price`
+    (fetched from API; fallback **0.10×** input price)
+  - Output: `output_tokens × output_per_million`
+
+- **`_fetch_pricing()`** — now also extracts `input_cache_read` and
+  `input_cache_write` from the API response, returning them as
+  `input_cache_read_per_million` and `input_cache_write_per_million`
+  in the pricing dict.
+
+### Public API
+
+New top-level exports in `aistatus.__init__`:
+
+```python
+from aistatus import AIStatusConfig, configure, get_config
+```
+
+### User Flow
+
+```python
+from aistatus import configure, Router
+
+# One-time setup (persisted to ~/.aistatus/config.yaml)
+configure(name="Alice", email="alice@example.com", upload=True)
+
+# Every route() call now uploads usage in the background
+router = Router()
+resp = router.route("Hello", model="claude-sonnet-4-6")
+# → usage record POSTed to aistatus.cc/api/usage/upload (async, silent)
+```
 
 ## 0.0.3 — 2026-03-23
 
