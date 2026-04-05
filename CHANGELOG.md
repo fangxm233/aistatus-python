@@ -132,6 +132,62 @@ Bridges local usage tracking to the remote leaderboard API.
   `input_cache_read_per_million` and `input_cache_write_per_million`
   in the pricing dict.
 
+### Fixes & Hardening
+
+#### Security
+
+- **Gateway auth** — `/health` endpoint now respects `public_paths` config
+  and requires auth when not listed
+- **Anthropic adapter** — concatenate multiple system messages instead of
+  last-wins; prevents silent prompt loss
+- **Router** — deduplicate system messages in `_normalize_messages()` when
+  both `system` option and messages list contain a system role
+
+#### Provider adapters — client reuse
+
+- **Compatible adapters** (DeepSeek, Groq, Mistral, xAI, etc.) — cache
+  HTTP client per `(base_url, api_key)` to prevent connection leak;
+  previously created a new `httpx.Client` per request
+- **OpenAI adapter** — same client caching pattern
+- **Anthropic adapter** — same client caching pattern
+- **Google adapter** — check for API key change before reusing cached
+  client to avoid stale credentials
+
+#### API client
+
+- **`StatusAPI`** — reuse `httpx.Client` across calls instead of creating
+  per-request; add proper `close()` / context manager support
+
+#### Gateway server
+
+- **SSE translator** — fix `finish_reason`/`[DONE]` ordering edge case
+  on stream truncation; emit error SSE event on mid-stream upstream failure
+- **Streaming usage** — gateway `_record_stream_usage()` now correctly
+  captures cache token fields from streamed chunks
+- **Translate path** — usage extraction for translated (cross-provider)
+  requests now recorded properly
+
+#### Usage & pricing
+
+- **Retry latency** — include sleep backoff time in retry latency
+  measurement (was undercounting)
+- **Pricing cache** — atomic write-then-rename for `pricing-cache.json`
+  to prevent corruption on concurrent access; file cache read hardened
+  against malformed JSON
+
+#### Uploader
+
+- **Thread safety** — `UsageUploader` uses class-level
+  `threading.Lock` + double-checked locking for shared executor init
+  (was racy on first concurrent use)
+
+#### Tests
+
+- New and expanded test suites: `test_uploader.py` (316 lines),
+  `test_proxy_model_extraction.py`, `test_pricing.py`,
+  `test_model_health.py` — covering retry handling, translate-path
+  usage extraction, cooldown persistence, and cache-safe persistence
+
 ### Public API
 
 New top-level exports in `aistatus.__init__`:
