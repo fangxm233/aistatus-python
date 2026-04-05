@@ -776,6 +776,12 @@ class GatewayServer:
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: web.Request) -> web.Response:
+        # Health check respects auth config (bypassed only when /health is in public_paths)
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": {"message": "Unauthorized", "type": "gateway_error"}},
+                status=401,
+            )
         return web.json_response({
             "status": "ok",
             "endpoints": list(self.config.endpoints.keys()),

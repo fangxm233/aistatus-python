@@ -145,17 +145,19 @@ class AnthropicAdapter(ProviderAdapter):
         # Extract response_format from kwargs
         response_format = kw.pop("response_format", None)
 
-        system = None
+        system_parts: list[str] = []
         user_msgs = []
         for m in messages:
             if m["role"] == "system":
-                system = m["content"] if isinstance(m["content"], str) else str(m["content"])
+                part = m["content"] if isinstance(m["content"], str) else str(m["content"])
+                system_parts.append(part)
             else:
                 msg = dict(m)
                 if not isinstance(msg.get("content"), str):
                     msg["content"] = self._content_blocks_to_anthropic(msg["content"])
                 user_msgs.append(msg)
 
+        system = "\n\n".join(system_parts) if system_parts else None
         # Apply response format as system prompt instruction
         system = self._apply_response_format(kw, response_format, system)
 
@@ -184,17 +186,19 @@ class AnthropicAdapter(ProviderAdapter):
 
         response_format = kw.pop("response_format", None)
 
-        system = None
+        system_parts: list[str] = []
         user_msgs = []
         for m in messages:
             if m["role"] == "system":
-                system = m["content"] if isinstance(m["content"], str) else str(m["content"])
+                part = m["content"] if isinstance(m["content"], str) else str(m["content"])
+                system_parts.append(part)
             else:
                 msg = dict(m)
                 if not isinstance(msg.get("content"), str):
                     msg["content"] = self._content_blocks_to_anthropic(msg["content"])
                 user_msgs.append(msg)
 
+        system = "\n\n".join(system_parts) if system_parts else None
         system = self._apply_response_format(kw, response_format, system)
 
         params: dict[str, Any] = {

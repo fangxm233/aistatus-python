@@ -17,20 +17,25 @@ from .config import AIStatusConfig
 
 
 class UsageUploader:
-    _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="aistatus-upload")
-    _executor_registered = False
+    _shared_executor: ThreadPoolExecutor | None = None
+    _shared_lock = threading.Lock()
 
     def __init__(self, config: AIStatusConfig):
         self.config = config
         self._base_url = config.base_url.rstrip("/")
-        self._register_shutdown()
+        self._ensure_executor()
 
     @classmethod
-    def _register_shutdown(cls) -> None:
-        if cls._executor_registered:
+    def _ensure_executor(cls) -> None:
+        if cls._shared_executor is not None:
             return
-        atexit.register(lambda: cls._executor.shutdown(wait=True, cancel_futures=False))
-        cls._executor_registered = True
+        with cls._shared_lock:
+            if cls._shared_executor is not None:
+                return
+            cls._shared_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="aistatus-upload",
+            )
+            atexit.register(lambda: cls._shared_executor.shutdown(wait=False))
 
     def upload(self, record: dict[str, Any]) -> None:
         if not self.config.upload_enabled:
@@ -56,7 +61,7 @@ class UsageUploader:
             ],
             "sdk_version": __version__,
         }
-        self._executor.submit(self._post, payload)
+        self._shared_executor.submit(self._post, payload)
 
     def _post(self, payload: dict[str, Any]) -> None:
         try:

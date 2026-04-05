@@ -169,7 +169,14 @@ class Router:
             msgs = list(messages)
 
         if system:
-            msgs.insert(0, {"role": "system", "content": system})
+            # Avoid duplicate system messages: if first message is already system, prepend to its content
+            if msgs and msgs[0].get("role") == "system":
+                existing = msgs[0]["content"]
+                if not isinstance(existing, str):
+                    existing = str(existing)
+                msgs[0] = {"role": "system", "content": f"{system}\n\n{existing}"}
+            else:
+                msgs.insert(0, {"role": "system", "content": system})
 
         return msgs
 
@@ -555,8 +562,8 @@ class Router:
                 # Retry on 429
                 if should_retry and status == 429:
                     try:
-                        time.sleep(retry_delay)
                         started_retry = time.monotonic()
+                        time.sleep(retry_delay)
                         self._run_before_request(messages, candidate, kwargs)
                         resp = adapter.call(candidate.model_id, messages, timeout, **kwargs)
                         if self.health:

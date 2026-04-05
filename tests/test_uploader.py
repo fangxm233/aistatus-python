@@ -167,7 +167,7 @@ class TestUsageUploader:
 
     def test_upload_builds_payload_and_submits_background_post(self, monkeypatch):
         executor = DummyExecutor()
-        monkeypatch.setattr(UsageUploader, "_executor", executor)
+        monkeypatch.setattr(UsageUploader, "_shared_executor", executor)
         uploader = UsageUploader(
             AIStatusConfig(
                 upload_enabled=True,
@@ -214,7 +214,7 @@ class TestUsageUploader:
 
     def test_upload_truncates_identity_fields(self, monkeypatch):
         executor = DummyExecutor()
-        monkeypatch.setattr(UsageUploader, "_executor", executor)
+        monkeypatch.setattr(UsageUploader, "_shared_executor", executor)
         uploader = UsageUploader(
             AIStatusConfig(
                 upload_enabled=True,
@@ -235,7 +235,7 @@ class TestUsageUploader:
     def test_upload_uses_executor_instead_of_spawning_threads(self, monkeypatch):
         executor = DummyExecutor()
         thread_factory = ThreadFactory()
-        monkeypatch.setattr(UsageUploader, "_executor", executor)
+        monkeypatch.setattr(UsageUploader, "_shared_executor", executor)
         monkeypatch.setattr("aistatus.uploader.threading.Thread", thread_factory)
         uploader = UsageUploader(AIStatusConfig(upload_enabled=True, name="Alice", email="alice@example.com"))
 

@@ -19,6 +19,7 @@ class GoogleAdapter(ProviderAdapter):
     def __init__(self, config):
         super().__init__(config)
         self._client = None
+        self._client_key: str | None = None
 
     def _get_api_key(self):
         import os
@@ -35,13 +36,15 @@ class GoogleAdapter(ProviderAdapter):
         raise ProviderNotConfigured("google", "GEMINI_API_KEY")
 
     def _get_client(self):
-        if self._client is not None:
+        api_key = self._get_api_key()
+        if self._client is not None and self._client_key == api_key:
             return self._client
         try:
             from google import genai
         except ImportError:
             raise ProviderNotInstalled("google", "google-genai")
-        self._client = genai.Client(api_key=self._get_api_key())
+        self._client = genai.Client(api_key=api_key)
+        self._client_key = api_key
         return self._client
 
     @staticmethod

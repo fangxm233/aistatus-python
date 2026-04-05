@@ -32,23 +32,53 @@ def _create_compatible_client(config, default_base_url: str, env_key_name: str, 
     return openai.OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
 
 
-@register
-class DeepSeekAdapter(OpenAIAdapter):
+def _resolve_api_key(config, env_key_name: str) -> str:
+    """Resolve API key from config or environment."""
+    if config.api_key:
+        return config.api_key
+    if config.env:
+        key = os.environ.get(config.env)
+        if key:
+            return key
+    key = os.environ.get(env_key_name)
+    if key:
+        return key
+    return ""
+
+
+class _CachedCompatibleMixin:
+    """Mixin that caches sync/async clients, rebuilding on key change."""
+    _compat_base_url: str = ""
+    _compat_env_key: str = ""
+
     def _get_client(self):
-        return _create_compatible_client(self.config, "https://api.deepseek.com", "DEEPSEEK_API_KEY", False)
+        key = _resolve_api_key(self.config, self._compat_env_key)
+        if self._client is not None and self._client_key == key:
+            return self._client
+        self._client = _create_compatible_client(self.config, self._compat_base_url, self._compat_env_key, False)
+        self._client_key = key
+        return self._client
 
     def _get_async_client(self):
-        return _create_compatible_client(self.config, "https://api.deepseek.com", "DEEPSEEK_API_KEY", True)
+        key = _resolve_api_key(self.config, self._compat_env_key)
+        if self._async_client is not None and self._async_client_key == key:
+            return self._async_client
+        self._async_client = _create_compatible_client(self.config, self._compat_base_url, self._compat_env_key, True)
+        self._async_client_key = key
+        return self._async_client
 
 
 @register
-class MistralAdapter(OpenAIAdapter):
+class DeepSeekAdapter(_CachedCompatibleMixin, OpenAIAdapter):
+    _compat_base_url = "https://api.deepseek.com"
+    _compat_env_key = "DEEPSEEK_API_KEY"
+
+
+@register
+class MistralAdapter(_CachedCompatibleMixin, OpenAIAdapter):
     """Mistral adapter. Registered as 'mistral' (canonical name)."""
-    def _get_client(self):
-        return _create_compatible_client(self.config, "https://api.mistral.ai/v1", "MISTRAL_API_KEY", False)
-
-    def _get_async_client(self):
-        return _create_compatible_client(self.config, "https://api.mistral.ai/v1", "MISTRAL_API_KEY", True)
+    _compat_base_url = "https://api.mistral.ai/v1"
+    _compat_env_key = "MISTRAL_API_KEY"
 
 
 # Backward compat: keep old name as alias
@@ -58,48 +88,33 @@ register_adapter_type("mistralai", MistralAdapter)
 
 
 @register
-class XAIAdapter(OpenAIAdapter):
-    def _get_client(self):
-        return _create_compatible_client(self.config, "https://api.x.ai/v1", "XAI_API_KEY", False)
-
-    def _get_async_client(self):
-        return _create_compatible_client(self.config, "https://api.x.ai/v1", "XAI_API_KEY", True)
+class XAIAdapter(_CachedCompatibleMixin, OpenAIAdapter):
+    _compat_base_url = "https://api.x.ai/v1"
+    _compat_env_key = "XAI_API_KEY"
 
 
 @register
-class GroqAdapter(OpenAIAdapter):
-    def _get_client(self):
-        return _create_compatible_client(self.config, "https://api.groq.com/openai/v1", "GROQ_API_KEY", False)
-
-    def _get_async_client(self):
-        return _create_compatible_client(self.config, "https://api.groq.com/openai/v1", "GROQ_API_KEY", True)
+class GroqAdapter(_CachedCompatibleMixin, OpenAIAdapter):
+    _compat_base_url = "https://api.groq.com/openai/v1"
+    _compat_env_key = "GROQ_API_KEY"
 
 
 @register
-class TogetherAdapter(OpenAIAdapter):
-    def _get_client(self):
-        return _create_compatible_client(self.config, "https://api.together.xyz/v1", "TOGETHER_API_KEY", False)
-
-    def _get_async_client(self):
-        return _create_compatible_client(self.config, "https://api.together.xyz/v1", "TOGETHER_API_KEY", True)
+class TogetherAdapter(_CachedCompatibleMixin, OpenAIAdapter):
+    _compat_base_url = "https://api.together.xyz/v1"
+    _compat_env_key = "TOGETHER_API_KEY"
 
 
 @register
-class MoonshotAIAdapter(OpenAIAdapter):
-    def _get_client(self):
-        return _create_compatible_client(self.config, "https://api.moonshot.cn/v1", "MOONSHOT_API_KEY", False)
-
-    def _get_async_client(self):
-        return _create_compatible_client(self.config, "https://api.moonshot.cn/v1", "MOONSHOT_API_KEY", True)
+class MoonshotAIAdapter(_CachedCompatibleMixin, OpenAIAdapter):
+    _compat_base_url = "https://api.moonshot.cn/v1"
+    _compat_env_key = "MOONSHOT_API_KEY"
 
 # Also register "moonshot" as alias for MoonshotAI
 register_adapter_type("moonshot", MoonshotAIAdapter)
 
 
 @register
-class QwenAdapter(OpenAIAdapter):
-    def _get_client(self):
-        return _create_compatible_client(self.config, "https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY", False)
-
-    def _get_async_client(self):
-        return _create_compatible_client(self.config, "https://dashscope.aliyuncs.com/compatible-mode/v1", "DASHSCOPE_API_KEY", True)
+class QwenAdapter(_CachedCompatibleMixin, OpenAIAdapter):
+    _compat_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    _compat_env_key = "DASHSCOPE_API_KEY"

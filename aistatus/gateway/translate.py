@@ -194,9 +194,7 @@ async def openai_sse_to_anthropic_sse(
                         "delta": {"type": "text_delta", "text": text},
                     })
 
-                if choices[0].get("finish_reason"):
-                    if finished:
-                        return
+                if choices[0].get("finish_reason") and not finished:
                     finished = True
                     yield _sse("content_block_stop", {
                         "type": "content_block_stop", "index": 0,

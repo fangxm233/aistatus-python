@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import yaml
 
 CONFIG_PATH = Path.home() / ".aistatus" / "config.yaml"
 TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_config_lock = threading.Lock()
 
 
 @dataclass
@@ -68,7 +70,9 @@ def _save_to_file(config: AIStatusConfig) -> None:
 def get_config() -> AIStatusConfig:
     global _config
     if _config is None:
-        _config = _load_from_file()
+        with _config_lock:
+            if _config is None:
+                _config = _load_from_file()
     return _config
 
 
