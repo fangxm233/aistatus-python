@@ -1,8 +1,14 @@
+# input: anthropic SDK clients, provider config, OpenAI-style chat messages, and response-format hints
+# output: Anthropic-backed sync/async route responses with content-block conversion and cached client reuse
+# pos: provider adapter that maps SDK chat requests onto Anthropic Messages APIs while preserving usage data
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 """Anthropic provider adapter."""
 
 from __future__ import annotations
 
 import os
+import anthropic
 from typing import Any
 
 from ..exceptions import ProviderNotConfigured, ProviderNotInstalled
@@ -12,6 +18,13 @@ from .base import ProviderAdapter, register
 
 @register
 class AnthropicAdapter(ProviderAdapter):
+    def __init__(self, config):
+        super().__init__(config)
+        self._client: anthropic.Anthropic | None = None
+        self._async_client: anthropic.AsyncAnthropic | None = None
+        self._client_key: str | None = None
+        self._async_client_key: str | None = None
+
     def _get_api_key(self):
         if self.config.api_key:
             return self.config.api_key
@@ -26,26 +39,26 @@ class AnthropicAdapter(ProviderAdapter):
         raise ProviderNotConfigured("anthropic", "ANTHROPIC_API_KEY")
 
     def _get_client(self):
-        try:
-            import anthropic
-        except ImportError:
-            raise ProviderNotInstalled("anthropic", "anthropic")
-
-        return anthropic.Anthropic(
-            api_key=self._get_api_key(),
+        api_key = self._get_api_key()
+        if self._client is not None and self._client_key == api_key:
+            return self._client
+        self._client = anthropic.Anthropic(
+            api_key=api_key,
             base_url=self.config.base_url
         )
+        self._client_key = api_key
+        return self._client
 
     def _get_async_client(self):
-        try:
-            import anthropic
-        except ImportError:
-            raise ProviderNotInstalled("anthropic", "anthropic")
-
-        return anthropic.AsyncAnthropic(
-            api_key=self._get_api_key(),
+        api_key = self._get_api_key()
+        if self._async_client is not None and self._async_client_key == api_key:
+            return self._async_client
+        self._async_client = anthropic.AsyncAnthropic(
+            api_key=api_key,
             base_url=self.config.base_url
         )
+        self._async_client_key = api_key
+        return self._async_client
 
     def _to_response(self, r, model_id: str) -> RouteResponse:
         text_parts = [b.text for b in r.content if hasattr(b, "text")]

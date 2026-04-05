@@ -7,10 +7,10 @@ Tests are written to validate gateway features before implementation changes.
 | filename | role | function |
 |---|---|---|
 | `test_hybrid_backend.py` | regression | Verify backend ordering, config parsing, and status reporting |
-| `test_proxy_model_extraction.py` | regression | Verify model extraction, global model pre-checks, model health tracking, and model fallback behavior |
+| `test_proxy_model_extraction.py` | regression | Verify model extraction, fallback headers, translate-stream usage tracking, and translation warnings |
 | `test_usage_endpoint.py` | regression | Verify `/usage` HTTP endpoint summaries and validation |
-| `test_pricing.py` | regression | Verify pricing lookup handles versioned Claude model IDs and base aliases |
-| `test_model_health.py` | regression | Verify `HealthTracker` backend/model dual-layer behavior |
+| `test_pricing.py` | regression | Verify pricing lookup handles versioned Claude IDs, base aliases, and atomic cache writes |
+| `test_model_health.py` | regression | Verify `HealthTracker` backend/model dual-layer behavior and cooldown persistence |
 | `test_graceful_shutdown.py` | regression | Verify signal handling and PID cleanup |
 | `test_config.py` | regression | Verify SDK upload config defaults, file/env precedence, and configure() persistence |
-| `test_uploader.py` | regression | Verify fire-and-forget usage uploader gating, payload mapping, and silent exception handling |
+| `test_uploader.py` | regression | Verify uploader field limits, executor usage, router streaming usage, API/provider client caching, and targeted retry/provider regressions |

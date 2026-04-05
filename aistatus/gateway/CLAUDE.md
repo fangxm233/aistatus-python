@@ -10,6 +10,6 @@ Shared by the SDK gateway runtime without Cortex-specific logic.
 | `__main__.py` | CLI | Expose `python -m aistatus.gateway` commands |
 | `auth.py` | auth | GatewayAuthConfig dataclass and check_gateway_auth validation |
 | `config.py` | config | Load and validate gateway.yaml, endpoints, auth, mode-aware configs, and model fallbacks |
-| `health.py` | health | Track backend/model health with cooldown windows |
-| `server.py` | proxy | Serve `/health` `/status` `/usage`, pre-mark globally degraded models, proxy upstream requests, and upload usage records |
-| `translate.py` | protocol | Translate Anthropic/OpenAI request and SSE formats when needed |
+| `health.py` | health | Track backend/model health with cooldown windows that persist through recent-error periods |
+| `server.py` | proxy | Serve `/health` `/status` `/usage`, pre-mark globally degraded models, proxy upstream requests, and record translate-path usage |
+| `translate.py` | protocol | Translate Anthropic/OpenAI request and SSE formats with non-text warnings and usage-preserving terminal events |

@@ -381,38 +381,68 @@ class Router:
         if not candidates:
             raise AllProvidersDown([f"no adapter for model '{model}'"])
 
+        first = candidates[0]
+
         for candidate in candidates:
             adapter = self.adapters.get(candidate.adapter_key)
             if not adapter:
                 continue
 
-            # Skip unhealthy providers
             if self.health and not self.health.is_healthy(candidate.provider_slug):
                 continue
 
             try:
-                if hasattr(adapter, 'call_stream') and adapter.call_stream is not None:
-                    async for chunk in adapter.call_stream(candidate.model_id, msgs, timeout, **kwargs):
+                started = time.monotonic()
+                last_usage: dict[str, int] | None = None
+                stream_fn = getattr(adapter, "acall_stream", None)
+                if callable(stream_fn):
+                    async for chunk in stream_fn(candidate.model_id, msgs, timeout, **kwargs):
+                        if chunk.get("type") == "usage":
+                            last_usage = {
+                                "input_tokens": int(chunk.get("input_tokens", 0)),
+                                "output_tokens": int(chunk.get("output_tokens", 0)),
+                                "cache_creation_input_tokens": int(chunk.get("cache_creation_input_tokens", 0)),
+                                "cache_read_input_tokens": int(chunk.get("cache_read_input_tokens", 0)),
+                            }
                         yield chunk
                     if self.health:
                         self.health.record_success(candidate.provider_slug)
+                    if self.usage is not None and last_usage is not None:
+                        latency_ms = round((time.monotonic() - started) * 1000)
+                        routed = self._build_response(
+                            RouteResponse(
+                                content="",
+                                model_used=candidate.model_id,
+                                provider_used=candidate.provider_slug,
+                                was_fallback=False,
+                                input_tokens=last_usage["input_tokens"],
+                                output_tokens=last_usage["output_tokens"],
+                                cache_creation_input_tokens=last_usage["cache_creation_input_tokens"],
+                                cache_read_input_tokens=last_usage["cache_read_input_tokens"],
+                            ),
+                            candidate,
+                            first,
+                        )
+                        self.usage.record(routed, latency_ms)
                     return
-                else:
-                    # Fallback: call() then emit as chunks
-                    resp = await adapter.acall(candidate.model_id, msgs, timeout, **kwargs)
-                    if self.health:
-                        self.health.record_success(candidate.provider_slug)
 
-                    yield {"type": "text", "text": resp.content}
-                    yield {
-                        "type": "usage",
-                        "input_tokens": resp.input_tokens,
-                        "output_tokens": resp.output_tokens,
-                        "cache_creation_input_tokens": resp.cache_creation_input_tokens,
-                        "cache_read_input_tokens": resp.cache_read_input_tokens,
-                    }
-                    yield {"type": "done"}
-                    return
+                resp = await adapter.acall(candidate.model_id, msgs, timeout, **kwargs)
+                if self.health:
+                    self.health.record_success(candidate.provider_slug)
+
+                yield {"type": "text", "text": resp.content}
+                yield {
+                    "type": "usage",
+                    "input_tokens": resp.input_tokens,
+                    "output_tokens": resp.output_tokens,
+                    "cache_creation_input_tokens": resp.cache_creation_input_tokens,
+                    "cache_read_input_tokens": resp.cache_read_input_tokens,
+                }
+                yield {"type": "done"}
+                if self.usage is not None:
+                    latency_ms = round((time.monotonic() - started) * 1000)
+                    self.usage.record(self._build_response(resp, candidate, first), latency_ms)
+                return
             except Exception as e:
                 status = getattr(e, "status", None) or getattr(e, "status_code", None)
                 if self.health and status:
@@ -542,7 +572,11 @@ class Router:
                         if self.health and retry_status:
                             self.health.record_error(candidate.provider_slug, retry_status)
                         self._run_on_error(retry_e, candidate)
+                        log.warning("Retry after 429 failed for %s/%s: %s", candidate.provider_slug, candidate.model_id, retry_e)
                         tried.append(f"{candidate.provider_slug}[retry-failed]")
+                        if not allow_fallback:
+                            raise ProviderCallFailed(candidate.provider_slug, candidate.model_id, retry_e)
+                        continue
                 else:
                     log.warning("Call to %s/%s failed: %s", candidate.provider_slug, candidate.model_id, e)
                     tried.append(f"{candidate.provider_slug}[error]")
@@ -641,7 +675,11 @@ class Router:
                         if self.health and retry_status:
                             self.health.record_error(candidate.provider_slug, retry_status)
                         await self._arun_on_error(retry_e, candidate)
+                        log.warning("Retry after 429 failed for %s/%s: %s", candidate.provider_slug, candidate.model_id, retry_e)
                         tried.append(f"{candidate.provider_slug}[retry-failed]")
+                        if not allow_fallback:
+                            raise ProviderCallFailed(candidate.provider_slug, candidate.model_id, retry_e)
+                        continue
                 else:
                     log.warning("Call to %s/%s failed: %s", candidate.provider_slug, candidate.model_id, e)
                     tried.append(f"{candidate.provider_slug}[error]")

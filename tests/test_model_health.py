@@ -1,8 +1,7 @@
-"""Tests for model-level health tracking in HealthTracker.
-
-Verifies dual-layer tracking: backend-level + (backend, model)-level.
-Model-level health is independent from backend-level health.
-"""
+# input: pytest, unittest.mock time patching, and aistatus.gateway.health HealthTracker
+# output: regression tests for dual-layer health tracking and cooldown clearing behavior
+# pos: validates backend/model health state transitions, summaries, and cooldown persistence rules
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 from __future__ import annotations
 
@@ -90,8 +89,8 @@ class TestModelHealthRecordError:
 class TestModelHealthRecordSuccess:
     """record_success with model= parameter."""
 
-    def test_model_success_clears_model_cooldown(self):
-        """Success at model level clears model cooldown."""
+    def test_model_success_does_not_clear_model_cooldown_while_recent_errors_exist(self):
+        """Success should not clear cooldown when the recent error window is still non-empty."""
         ht = HealthTracker()
         bid = "anthropic:key:0"
 
@@ -99,9 +98,7 @@ class TestModelHealthRecordSuccess:
         assert not ht.is_healthy(bid, model="claude-opus-4-6")
 
         ht.record_success(bid, model="claude-opus-4-6")
-        # After window errors are < threshold, model should be healthy again
-        # (success clears cooldown, and only 1 error in window < 5 threshold)
-        assert ht.is_healthy(bid, model="claude-opus-4-6")
+        assert not ht.is_healthy(bid, model="claude-opus-4-6")
 
     def test_model_success_does_not_clear_backend_cooldown(self):
         """Model-level success does not affect backend-level cooldown."""
@@ -140,16 +137,20 @@ class TestModelHealthBackwardCompat:
             ht.record_error(bid, 429)
         assert not ht.is_healthy(bid)
 
-    def test_no_model_record_success_same_as_before(self):
-        """record_success without model= clears backend cooldown."""
+
+    def test_backend_success_does_not_clear_cooldown_while_recent_errors_exist(self):
         ht = HealthTracker()
         bid = "anthropic:key:0"
 
-        ht.record_error(bid, 429)
-        assert not ht.is_healthy(bid)
+        with patch("aistatus.gateway.health.time") as mock_time:
+            mock_time.monotonic.return_value = 100.0
+            ht.record_error(bid, 429)
+            assert not ht.is_healthy(bid)
 
-        ht.record_success(bid)
-        assert ht.is_healthy(bid)
+            mock_time.monotonic.return_value = 101.0
+            ht.record_success(bid)
+
+            assert not ht.is_healthy(bid)
 
 
 class TestModelHealthSummary:

@@ -1,6 +1,12 @@
+# input: usage records, per-project filesystem paths, and stdlib CSV/JSON/file-lock helpers
+# output: locked JSONL usage persistence plus filtered reads and export helpers
+# pos: local on-disk storage backend for SDK and gateway usage tracking
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
@@ -20,7 +26,12 @@ class UsageStorage:
         month_file = self._project_dir / f"{self._month_key(record.get('ts'))}.jsonl"
         month_file.parent.mkdir(parents=True, exist_ok=True)
         with month_file.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     def read(self, period: str = "month", all_projects: bool = False) -> list[dict[str, Any]]:
         project_dirs = self._all_project_dirs() if all_projects else [self._project_dir]

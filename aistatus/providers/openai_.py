@@ -12,6 +12,13 @@ from .base import ProviderAdapter, register
 
 @register
 class OpenAIAdapter(ProviderAdapter):
+    def __init__(self, config):
+        super().__init__(config)
+        self._client = None
+        self._async_client = None
+        self._client_key: tuple[str, str | None, tuple[tuple[str, str], ...] | None] | None = None
+        self._async_client_key: tuple[str, str | None, tuple[tuple[str, str], ...] | None] | None = None
+
     def _get_api_key(self):
         if self.config.api_key:
             return self.config.api_key
@@ -37,11 +44,21 @@ class OpenAIAdapter(ProviderAdapter):
         except ImportError:
             raise ProviderNotInstalled("openai", "openai")
 
-        return openai.OpenAI(
-            api_key=self._get_api_key(),
-            base_url=self._get_base_url(),
+        client_key = (
+            self._get_api_key(),
+            self._get_base_url(),
+            tuple(sorted(self._get_default_headers().items())) if self._get_default_headers() else None,
+        )
+        if self._client is not None and self._client_key == client_key:
+            return self._client
+
+        self._client = openai.OpenAI(
+            api_key=client_key[0],
+            base_url=client_key[1],
             default_headers=self._get_default_headers(),
         )
+        self._client_key = client_key
+        return self._client
 
     def _get_async_client(self):
         try:
@@ -49,11 +66,21 @@ class OpenAIAdapter(ProviderAdapter):
         except ImportError:
             raise ProviderNotInstalled("openai", "openai")
 
-        return openai.AsyncOpenAI(
-            api_key=self._get_api_key(),
-            base_url=self._get_base_url(),
+        client_key = (
+            self._get_api_key(),
+            self._get_base_url(),
+            tuple(sorted(self._get_default_headers().items())) if self._get_default_headers() else None,
+        )
+        if self._async_client is not None and self._async_client_key == client_key:
+            return self._async_client
+
+        self._async_client = openai.AsyncOpenAI(
+            api_key=client_key[0],
+            base_url=client_key[1],
             default_headers=self._get_default_headers(),
         )
+        self._async_client_key = client_key
+        return self._async_client
 
     @staticmethod
     def _content_blocks_to_openai(content: str | list) -> str | list:

@@ -1,6 +1,11 @@
-"""Thin client for the aistatus.cc public API."""
+# input: httpx sync/async clients plus provider/model query parameters
+# output: cached public aistatus.cc API lookups for provider status, model checks, and search results
+# pos: thin SDK HTTP client for status/model metadata with reusable sync and async transports
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 from __future__ import annotations
+
+import atexit
 
 import httpx
 
@@ -11,25 +16,50 @@ BASE_URL = "https://aistatus.cc"
 
 
 class StatusAPI:
-    """Stateless HTTP client for aistatus.cc.  All methods are class-level."""
+    """Cached HTTP client for aistatus.cc."""
 
     def __init__(self, base_url: str = BASE_URL, timeout: float = 3.0):
         self._base = base_url.rstrip("/")
         self._timeout = timeout
+        self._client: httpx.Client | None = None
+        self._async_client: httpx.AsyncClient | None = None
+        self._shutdown_registered = False
+
+    def _get_client(self) -> httpx.Client:
+        if self._client is None:
+            self._client = httpx.Client(timeout=self._timeout)
+        return self._client
+
+    def _get_async_client(self) -> httpx.AsyncClient:
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(timeout=self._timeout)
+        if not self._shutdown_registered:
+            atexit.register(self.close)
+            self._shutdown_registered = True
+        return self._async_client
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def aclose(self) -> None:
+        self.close()
+        if self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
 
     # ---- sync helpers ------------------------------------------------
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        with httpx.Client(timeout=self._timeout) as c:
-            r = c.get(f"{self._base}{path}", params=params)
-            r.raise_for_status()
-            return r.json()
+        r = self._get_client().get(f"{self._base}{path}", params=params)
+        r.raise_for_status()
+        return r.json()
 
     async def _aget(self, path: str, params: dict | None = None) -> dict:
-        async with httpx.AsyncClient(timeout=self._timeout) as c:
-            r = await c.get(f"{self._base}{path}", params=params)
-            r.raise_for_status()
-            return r.json()
+        r = await self._get_async_client().get(f"{self._base}{path}", params=params)
+        r.raise_for_status()
+        return r.json()
 
     # ---- public methods (sync) ----------------------------------------
 

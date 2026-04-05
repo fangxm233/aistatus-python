@@ -443,8 +443,11 @@ class GatewayServer:
 
             from .translate import openai_sse_to_anthropic_sse
 
+            raw_chunks: list[bytes] = []
+
             async def _chunks():
                 async for chunk in upstream.content.iter_any():
+                    raw_chunks.append(chunk)
                     yield chunk
 
             try:
@@ -452,6 +455,16 @@ class GatewayServer:
                     await resp.write(translated)
             finally:
                 upstream.release()
+                usage = self._extract_usage_from_sse(raw_chunks)
+                if usage is not None:
+                    self._record_stream_usage(
+                        backend=backend,
+                        original_model=original_model,
+                        input_tokens=usage["input_tokens"],
+                        output_tokens=usage["output_tokens"],
+                        cache_creation_input_tokens=usage["cache_creation_input_tokens"],
+                        cache_read_input_tokens=usage["cache_read_input_tokens"],
+                    )
             return resp
         else:
             resp = web.StreamResponse()
@@ -606,6 +619,41 @@ class GatewayServer:
 
         return json.dumps(data).encode()
 
+    def _record_stream_usage(
+        self,
+        *,
+        backend: dict[str, Any],
+        original_model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
+    ) -> None:
+        model = original_model or f"{self._infer_provider_from_backend(backend, original_model)}/unknown"
+        provider = self._infer_provider_from_backend(backend, model)
+        if cache_creation_input_tokens or cache_read_input_tokens:
+            cost = self.pricing.calculate_cost_with_cache(
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            )
+        else:
+            cost = self.pricing.calculate_cost(provider, model, input_tokens, output_tokens)
+        self.usage.record_usage(
+            provider=provider,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            latency_ms=0,
+            fallback=":fb:" in backend["id"],
+            cost=cost,
+        )
+
     def _record_usage_if_possible(
         self,
         *,
@@ -636,17 +684,21 @@ class GatewayServer:
 
         provider = self._infer_provider_from_backend(backend, model)
 
-        # Calculate cost using CostCalculator
         if cache_creation_in or cache_read_in:
             cost = self.pricing.calculate_cost_with_cache(
-                provider, model or f"{provider}/unknown",
-                input_tokens, output_tokens,
-                cache_creation_in, cache_read_in,
+                provider,
+                model or f"{provider}/unknown",
+                input_tokens,
+                output_tokens,
+                cache_creation_in,
+                cache_read_in,
             )
         else:
             cost = self.pricing.calculate_cost(
-                provider, model or f"{provider}/unknown",
-                input_tokens, output_tokens,
+                provider,
+                model or f"{provider}/unknown",
+                input_tokens,
+                output_tokens,
             )
 
         self.usage.record_usage(
@@ -660,6 +712,42 @@ class GatewayServer:
             fallback=":fb:" in backend["id"],
             cost=cost,
         )
+
+    @staticmethod
+    def _extract_usage_from_sse(chunks: list[bytes]) -> dict[str, int] | None:
+        payload = b"".join(chunks).decode("utf-8", errors="ignore")
+        input_tokens = 0
+        output_tokens = 0
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+        found = False
+        for event in payload.split("\n\n"):
+            for line in event.splitlines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    parsed = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                usage = parsed.get("usage") or {}
+                if not usage:
+                    continue
+                input_tokens = GatewayServer._as_int(usage.get("prompt_tokens", usage.get("input_tokens", input_tokens)))
+                output_tokens = GatewayServer._as_int(usage.get("completion_tokens", usage.get("output_tokens", output_tokens)))
+                cache_creation_input_tokens = GatewayServer._as_int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
+                cache_read_input_tokens = GatewayServer._as_int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
+                found = True
+        if not found:
+            return None
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+        }
 
     @staticmethod
     def _infer_provider_from_backend(backend: dict[str, Any], model: str) -> str:

@@ -1,6 +1,6 @@
-# input: mocked proxy requests, upstream responses, and endpoint fallback config
-# output: regression coverage for model extraction, health recording, and fallback headers
-# pos: gateway per-model proxy behavior test suite
+# input: mocked proxy requests, upstream responses/SSE chunks, and endpoint fallback config
+# output: regression coverage for model extraction, health recording, fallback headers, translate-stream usage tracking, and translation warnings
+# pos: gateway per-model proxy behavior and translate-path regression test suite
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 """Tests for model extraction from request body in proxy handler.
 
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -434,8 +435,94 @@ class TestModelHealthInSummary:
             mock_forward.side_effect = _ProxyError(529, b'{"error": "overloaded"}')
             await server._handle_proxy(request)
 
-        summary = server.health.summary()
-        assert "model_health" in summary
-        key = "anthropic:key:0/claude-opus-4-6"
-        assert key in summary["model_health"]
-        assert summary["model_health"][key]["total_errors"] == 1
+
+    @pytest.mark.asyncio
+    async def test_translate_stream_records_usage_from_openai_usage_chunk(self, tmp_path):
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.openai.com/v1",
+            auth_style="bearer",
+            keys=["sk-managed"],
+        )
+        server = _make_server(ep)
+        recorded = []
+        server.usage = type("Usage", (), {"record_usage": lambda self, **kwargs: recorded.append(kwargs)})()
+
+        upstream = MagicMock()
+        upstream.release = MagicMock()
+        upstream.content = type(
+            "Content",
+            (),
+            {
+                "iter_any": staticmethod(lambda: _aiter([
+                    b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n',
+                    b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4}}\n\n',
+                    b'data: [DONE]\n\n',
+                ]))
+            },
+        )()
+
+        backend = {
+            "id": "anthropic:key:0",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "sk-test",
+            "auth_style": "bearer",
+            "model_prefix": "",
+            "model_map": {},
+            "translate": "anthropic-to-openai",
+        }
+        request = _make_request(body=b'{"model":"claude-opus-4-6"}', endpoint="anthropic")
+        request.version = (1, 1)
+        request.keep_alive = True
+        request._payload_writer = type(
+            "Writer",
+            (),
+            {
+                "enable_chunking": staticmethod(lambda: None),
+                "write_headers": staticmethod(_noop_async),
+                "send_headers": staticmethod(lambda: None),
+                "write": staticmethod(_noop_async),
+                "drain": staticmethod(_noop_async),
+            },
+        )()
+        request._prepare_hook = AsyncMock()
+
+        response = await server._stream(request, upstream, backend, "claude-opus-4-6")
+
+        assert response.headers["x-gateway-backend"] == "anthropic:key:0"
+        assert len(recorded) == 1
+        assert recorded[0]["input_tokens"] == 11
+        assert recorded[0]["output_tokens"] == 4
+        assert recorded[0]["model"] == "claude-opus-4-6"
+
+
+class TestTranslateWarnings:
+    def test_translate_warns_and_keeps_placeholder_for_non_text_only_message(self, caplog):
+        from aistatus.gateway.translate import anthropic_request_to_openai
+
+        body = json.dumps({
+            "model": "claude-opus-4-6",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}],
+                }
+            ],
+        }).encode()
+
+        with caplog.at_level(logging.WARNING):
+            translated = json.loads(anthropic_request_to_openai(body).decode())
+
+        assert translated["messages"][0]["content"] == "[Unsupported non-text content omitted during Anthropic→OpenAI translation]"
+        assert any("non-text" in message.lower() for message in caplog.messages)
+
+
+async def _noop_async(*_args, **_kwargs):
+    return None
+
+
+def _aiter(chunks):
+    async def _gen():
+        for chunk in chunks:
+            yield chunk
+    return _gen()

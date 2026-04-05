@@ -9,18 +9,18 @@ Public imports are exposed from `__init__.py`, while internal modules implement 
 | `__init__.py` | public API | Export SDK entrypoints, version, models, exceptions, uploader, and lazy router helpers |
 | `__main__.py` | CLI entry | Run package-level CLI commands |
 | `_defaults.py` | config defaults | Hold default constants, provider aliases, and slug normalization helpers |
-| `api.py` | API client | Query aistatus status/model APIs |
+| `api.py` | API client | Query aistatus status/model APIs with reusable sync/async HTTP clients |
 | `content.py` | content helpers | Extract text from and normalize ContentBlock lists |
 | `middleware.py` | hook definitions | Middleware Protocol with before_request, after_response, on_error hooks |
 | `stream.py` | stream utilities | collect_stream_text and stream_to_text_chunks async helpers |
 | `exceptions.py` | error model | Define SDK exception types |
 | `models.py` | data model | Define routing/status dataclasses and types |
-| `pricing.py` | pricing lookup | Resolve model pricing and estimate token costs |
+| `pricing.py` | pricing lookup | Resolve model pricing and estimate token costs with atomic cache persistence |
 | `config.py` | upload config | Persist and resolve SDK upload identity/config from runtime, env, and file sources |
-| `uploader.py` | upload bridge | Build usage upload payloads and POST them asynchronously with silent failure semantics |
+| `uploader.py` | upload bridge | Build sanitized usage upload payloads and POST them asynchronously through a shared executor |
 | `router.py` | routing engine | Route requests across providers with fallback logic and config-backed usage upload |
 | `usage.py` | usage tracker | Record request usage, aggregate summaries, and fan out records to the uploader |
-| `usage_storage.py` | persistence | Store and read usage records on disk |
+| `usage_storage.py` | persistence | Store and read usage records on disk with locked JSONL appends |
 | `cli/` | CLI package | Subcommands and command-line integration |
-| `providers/` | provider adapters | Integrate Anthropic, OpenAI, Google, and other backends |
+| `providers/` | provider adapters | Integrate Anthropic, OpenAI, Google, and other backends with cached client reuse where needed |
 | `gateway/` | gateway package | Local HTTP gateway server, config, and health tracking |

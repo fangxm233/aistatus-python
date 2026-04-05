@@ -1,3 +1,8 @@
+# input: google-genai client, provider config, OpenAI-style chat messages, and generation params
+# output: Gemini-backed sync/async route responses with content-block conversion and timeout propagation
+# pos: provider adapter that maps SDK chat requests onto Google Gemini APIs with cached client reuse
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 """Google Gemini provider adapter."""
 
 from __future__ import annotations
@@ -11,9 +16,9 @@ from .base import ProviderAdapter, register
 
 @register
 class GoogleAdapter(ProviderAdapter):
-    @property
-    def slug(self) -> str:
-        return "google"
+    def __init__(self, config):
+        super().__init__(config)
+        self._client = None
 
     def _get_api_key(self):
         import os
@@ -30,11 +35,14 @@ class GoogleAdapter(ProviderAdapter):
         raise ProviderNotConfigured("google", "GEMINI_API_KEY")
 
     def _get_client(self):
+        if self._client is not None:
+            return self._client
         try:
             from google import genai
         except ImportError:
             raise ProviderNotInstalled("google", "google-genai")
-        return genai.Client(api_key=self._get_api_key())
+        self._client = genai.Client(api_key=self._get_api_key())
+        return self._client
 
     @staticmethod
     def _content_blocks_to_google(content: str | list) -> list[dict]:
@@ -126,7 +134,7 @@ class GoogleAdapter(ProviderAdapter):
 
         response_format = kw.pop("response_format", None)
 
-        config: dict[str, Any] = {}
+        config: dict[str, Any] = {"http_options": {"timeout": int(timeout * 1000)}}
         if system:
             config["system_instruction"] = system
 
@@ -156,7 +164,7 @@ class GoogleAdapter(ProviderAdapter):
 
         response_format = kw.pop("response_format", None)
 
-        config: dict[str, Any] = {}
+        config: dict[str, Any] = {"http_options": {"timeout": int(timeout * 1000)}}
         if system:
             config["system_instruction"] = system
 

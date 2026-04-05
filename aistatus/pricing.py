@@ -1,9 +1,16 @@
+# input: httpx model search API responses, filesystem cache files, and provider/model token counts
+# output: pricing lookups and cost estimates with in-memory plus atomic file-cache persistence
+# pos: shared pricing layer for SDK usage accounting and gateway cost attribution
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 """Pricing lookup and cost estimation for usage tracking."""
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -168,7 +175,14 @@ class CostCalculator:
 
     def _write_file_cache(self, cache: dict[str, dict[str, Any]]) -> None:
         self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix="pricing-cache-", suffix=".json", dir=self._cache_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp_name, self._cache_path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
     def _normalize_key(self, provider: str, model: str) -> str:
         provider_slug, model_name = self._split_model(provider, model)

@@ -1,14 +1,22 @@
+# input: Anthropic/OpenAI JSON payloads plus streaming SSE byte chunks
+# output: translated request/response bodies and SSE events with warnings for dropped non-text content
+# pos: protocol bridge used by the gateway when proxying between Anthropic and OpenAI-style APIs
+# >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
+
 """Translate between Anthropic Messages API and OpenAI Chat Completions API.
 
 Covers the common text-completion case (messages, system prompt, streaming).
-Tool use and multimodal content are NOT translated — they pass through as-is.
+Tool use and multimodal content are warned about and represented by placeholders.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import AsyncIterator
+
+log = logging.getLogger("aistatus.gateway.translate")
 
 
 # ---------------------------------------------------------------------------
@@ -39,10 +47,14 @@ def anthropic_request_to_openai(body: bytes) -> bytes:
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
-            # Text content blocks → concatenate
             texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+            non_text = [b for b in content if b.get("type") != "text"]
+            if non_text:
+                log.warning("Dropping non-text content blocks during Anthropic→OpenAI translation: %s", [b.get("type") for b in non_text])
             if texts:
                 messages.append({"role": role, "content": "\n".join(texts)})
+            elif non_text:
+                messages.append({"role": role, "content": "[Unsupported non-text content omitted during Anthropic→OpenAI translation]"})
 
     openai_body: dict = {"model": data.get("model", ""), "messages": messages}
 
@@ -105,6 +117,7 @@ async def openai_sse_to_anthropic_sse(
 ) -> AsyncIterator[bytes]:
     """Translate an OpenAI SSE stream into Anthropic SSE events."""
     msg_id = f"msg_gw_{int(time.time())}"
+    finished = False
 
     # Emit: message_start
     yield _sse("message_start", {
@@ -134,28 +147,28 @@ async def openai_sse_to_anthropic_sse(
 
     async for raw_chunk in chunks:
         buffer += raw_chunk
-        # Split on SSE event boundaries
         while b"\n\n" in buffer:
             event_bytes, buffer = buffer.split(b"\n\n", 1)
             event_str = event_bytes.decode("utf-8", errors="replace").strip()
             if not event_str:
                 continue
 
-            # Extract the data line(s)
             for line in event_str.split("\n"):
                 if not line.startswith("data:"):
                     continue
                 payload = line[5:].strip()
 
                 if payload == "[DONE]":
-                    # End of stream
+                    if finished:
+                        return
+                    finished = True
                     yield _sse("content_block_stop", {
                         "type": "content_block_stop", "index": 0,
                     })
                     yield _sse("message_delta", {
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                        "usage": {"output_tokens": output_tokens},
+                        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
                     })
                     yield _sse("message_stop", {"type": "message_stop"})
                     return
@@ -165,7 +178,6 @@ async def openai_sse_to_anthropic_sse(
                 except json.JSONDecodeError:
                     continue
 
-                # Usage info (when stream_options.include_usage is set)
                 if "usage" in oai and oai["usage"]:
                     input_tokens = oai["usage"].get("prompt_tokens", input_tokens)
                     output_tokens = oai["usage"].get("completion_tokens", output_tokens)
@@ -182,25 +194,28 @@ async def openai_sse_to_anthropic_sse(
                         "delta": {"type": "text_delta", "text": text},
                     })
 
-                # Check finish_reason
                 if choices[0].get("finish_reason"):
+                    if finished:
+                        return
+                    finished = True
                     yield _sse("content_block_stop", {
                         "type": "content_block_stop", "index": 0,
                     })
                     yield _sse("message_delta", {
                         "type": "message_delta",
                         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                        "usage": {"output_tokens": output_tokens},
+                        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
                     })
                     yield _sse("message_stop", {"type": "message_stop"})
                     return
 
-    # Stream ended without [DONE] or finish_reason — emit terminal events
+    if finished:
+        return
     yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
     yield _sse("message_delta", {
         "type": "message_delta",
         "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-        "usage": {"output_tokens": output_tokens},
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
     })
     yield _sse("message_stop", {"type": "message_stop"})
 

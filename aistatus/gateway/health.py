@@ -82,8 +82,10 @@ class HealthTracker:
     def record_success(self, backend_id: str, *, model: str | None = None):
         s = self._get_state(backend_id, model)
         s.total_requests += 1
-        # Successful request clears cooldown (backend/model recovered)
-        s.cooldown_until = 0.0
+        cutoff = time.monotonic() - _WINDOW_SIZE
+        recent_errors = any(t > cutoff for t in s.errors)
+        if not recent_errors:
+            s.cooldown_until = 0.0
 
     def error_count(self, backend_id: str, *, model: str | None = None) -> int:
         return self._get_state(backend_id, model).total_errors

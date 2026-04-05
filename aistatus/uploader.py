@@ -1,13 +1,15 @@
-# input: upload config, usage records, stdlib threading/json/urllib, and package version metadata
-# output: fire-and-forget POSTs of usage payloads to the aistatus upload API with silent failure semantics
+# input: upload config, usage records, stdlib json/urllib, shared background executor, and package version metadata
+# output: fire-and-forget POSTs of sanitized usage payloads to the aistatus upload API with silent failure semantics
 # pos: bridges local usage tracking to remote leaderboard ingestion without blocking SDK request flows
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 from __future__ import annotations
 
+import atexit
 import json
 import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import __version__
@@ -15,9 +17,20 @@ from .config import AIStatusConfig
 
 
 class UsageUploader:
+    _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="aistatus-upload")
+    _executor_registered = False
+
     def __init__(self, config: AIStatusConfig):
         self.config = config
         self._base_url = config.base_url.rstrip("/")
+        self._register_shutdown()
+
+    @classmethod
+    def _register_shutdown(cls) -> None:
+        if cls._executor_registered:
+            return
+        atexit.register(lambda: cls._executor.shutdown(wait=True, cancel_futures=False))
+        cls._executor_registered = True
 
     def upload(self, record: dict[str, Any]) -> None:
         if not self.config.upload_enabled:
@@ -28,9 +41,9 @@ class UsageUploader:
             "records": [
                 {
                     "ts": record["ts"],
-                    "name": self.config.name,
-                    "organization": self.config.organization,
-                    "email": self.config.email,
+                    "name": self._truncate(self.config.name, 200),
+                    "organization": self._truncate(self.config.organization, 200),
+                    "email": self._truncate(self.config.email, 254),
                     "provider": record["provider"],
                     "model": record["model"],
                     "input_tokens": record.get("in", 0),
@@ -43,7 +56,7 @@ class UsageUploader:
             ],
             "sdk_version": __version__,
         }
-        threading.Thread(target=self._post, args=(payload,), daemon=True).start()
+        self._executor.submit(self._post, payload)
 
     def _post(self, payload: dict[str, Any]) -> None:
         try:
@@ -58,3 +71,9 @@ class UsageUploader:
             )
         except Exception:
             pass
+
+    @staticmethod
+    def _truncate(value: str | None, limit: int) -> str:
+        if not value:
+            return ""
+        return value[:limit]
