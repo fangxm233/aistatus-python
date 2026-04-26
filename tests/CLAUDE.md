@@ -14,3 +14,4 @@ Tests are written to validate gateway features before implementation changes.
 | `test_graceful_shutdown.py` | regression | Verify signal handling and PID cleanup |
 | `test_config.py` | regression | Verify SDK upload config defaults, file/env precedence, and configure() persistence |
 | `test_uploader.py` | regression | Verify uploader field limits, executor usage, router streaming usage, API/provider client caching, and targeted retry/provider regressions |
+| `test_metadata_and_dump.py` | regression | Verify URL metadata parsing, UsageTracker metadata pass-through with reserved-key filtering, mode-dispatch routing, and GATEWAY_DUMP_DIR request+response dumps |

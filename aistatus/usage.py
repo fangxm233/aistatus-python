@@ -77,6 +77,11 @@ class UsageTracker:
         self._upload(record)
         return record
 
+    _RESERVED_KEYS = frozenset({
+        "ts", "provider", "model", "in", "out", "cost", "fallback",
+        "latency_ms", "billing_mode", "cache_creation_in", "cache_read_in",
+    })
+
     def record_usage(
         self,
         *,
@@ -90,6 +95,7 @@ class UsageTracker:
         fallback: bool,
         cost: float | None = None,
         billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         record_cost = cost
         if record_cost is None:
@@ -116,6 +122,10 @@ class UsageTracker:
             record["cache_creation_in"] = cache_creation_input_tokens
         if cache_read_input_tokens:
             record["cache_read_in"] = cache_read_input_tokens
+        if metadata:
+            for k, v in metadata.items():
+                if k not in self._RESERVED_KEYS:
+                    record[k] = v
         self.storage.append(record)
         self._upload(record)
         return record

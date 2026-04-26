@@ -1,6 +1,6 @@
-# input: gateway config, auth rules, aiohttp upstream requests, pricing, and upload config/uploader helpers
-# output: local gateway HTTP endpoints, proxied upstream responses, usage accounting, and optional usage upload
-# pos: SDK gateway runtime that fronts upstream providers with health/fallback and usage collection
+# input: gateway config, auth rules, aiohttp upstream requests, pricing, upload config/uploader helpers, and optional GATEWAY_DUMP_DIR env
+# output: local gateway HTTP endpoints, proxied upstream responses, usage accounting, optional usage upload, and optional request+response JSON dumps
+# pos: SDK gateway runtime that fronts upstream providers with health/fallback, usage collection, and optional dump of full API call payloads to GATEWAY_DUMP_DIR
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 """Gateway HTTP server — transparent proxy with failover and key rotation."""
@@ -13,6 +13,8 @@ import logging
 import os
 import signal
 import time
+from datetime import datetime, timezone
+from urllib.parse import unquote
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,36 @@ from .health import HealthTracker
 logger = logging.getLogger("aistatus.gateway")
 
 
+# Headers that must NOT be forwarded from upstream to the client:
+#   - hop-by-hop (RFC 7230 §6.1)
+#   - body-framing headers that are invalidated when we decode/re-encode the body
+#   - headers the gateway sets itself (overridden after this helper runs)
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "content-encoding",
+    "content-type",
+})
+
+
+def _forward_upstream_headers(upstream_headers: Any, target: Any) -> None:
+    """Copy all upstream response headers into target, skipping hop-by-hop and gateway-managed names."""
+    for key, value in upstream_headers.items():
+        lower = key.lower()
+        if lower in _HOP_BY_HOP_HEADERS:
+            continue
+        if lower.startswith("x-gateway-"):
+            continue
+        target[key] = value
+
+
 class GatewayServer:
     def __init__(self, config: GatewayConfig, pid_file: str | None = None):
         self.config = config
@@ -41,6 +73,10 @@ class GatewayServer:
         self._session: aiohttp.ClientSession | None = None
         self._key_idx: dict[str, int] = {}  # round-robin counters
         self._pid_file: Path | None = Path(pid_file) if pid_file else None
+        dump_dir_env = os.environ.get("GATEWAY_DUMP_DIR") or None
+        self._dump_dir: Path | None = Path(dump_dir_env) if dump_dir_env else None
+        if self._dump_dir is not None:
+            self._dump_dir.mkdir(parents=True, exist_ok=True)
 
     async def run(self):
         self._session = aiohttp.ClientSession(
@@ -55,8 +91,8 @@ class GatewayServer:
         app.router.add_get("/status", self._handle_status)
         app.router.add_get("/usage", self._handle_usage)
         app.router.add_post("/mode", self._handle_mode_switch)
-        # Per-request mode routing: /m/{mode}/{endpoint}/{path}
-        app.router.add_route("*", "/m/{mode}/{endpoint}/{path:.*}", self._handle_mode_proxy)
+        # Per-request mode routing: /m/{mode}/{metadata?}/{endpoint}/{path}
+        app.router.add_route("*", "/m/{tail:.*}", self._handle_mode_dispatch)
         # Catch-all proxy: /{endpoint}/...
         app.router.add_route("*", "/{endpoint}/{path:.*}", self._handle_proxy)
 
@@ -98,25 +134,55 @@ class GatewayServer:
     # Mode proxy handler
     # ------------------------------------------------------------------
 
-    async def _handle_mode_proxy(self, request: web.Request) -> web.StreamResponse:
-        """Handle per-request mode routing: /m/{mode}/{endpoint}/{path}."""
+    @staticmethod
+    def _parse_url_metadata(raw: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for pair in raw.split(","):
+            eq_idx = pair.find("=")
+            if eq_idx > 0:
+                result[unquote(pair[:eq_idx])] = unquote(pair[eq_idx + 1:])
+        return result
+
+    async def _handle_mode_dispatch(self, request: web.Request) -> web.StreamResponse:
+        """Handle per-request mode routing with optional metadata: /m/{mode}/{metadata?}/{endpoint}/{path}."""
         if not self._check_auth(request):
             return web.json_response(
                 {"error": {"message": "Unauthorized", "type": "gateway_error"}},
                 status=401,
             )
 
-        mode = request.match_info["mode"]
-        ep_name = request.match_info["endpoint"]
-        path = request.match_info["path"]
+        tail = request.match_info["tail"]
+        parts = tail.split("/", 3)
 
+        if len(parts) < 3:
+            return web.json_response(
+                {"error": {"message": f"Invalid mode path: /m/{tail}", "type": "gateway_error"}},
+                status=404,
+            )
+
+        mode = parts[0]
         mode_endpoints = self.config.endpoint_modes.get(mode)
         if not mode_endpoints:
             return web.json_response(
                 {"error": {"message": f"Unknown mode: {mode}", "type": "gateway_error"}},
-                status=404,
+                status=400,
             )
 
+        metadata: dict[str, str] | None = None
+
+        # Try 4-segment: mode/metadata/endpoint/path
+        if len(parts) >= 4:
+            ep_candidate = parts[2]
+            if ep_candidate in mode_endpoints:
+                metadata = self._parse_url_metadata(parts[1])
+                ep_name = ep_candidate
+                path = parts[3] if len(parts) > 3 else ""
+                endpoint = mode_endpoints[ep_name]
+                return await self._proxy_request(request, endpoint, path, billing_mode=mode, metadata=metadata)
+
+        # 3-segment: mode/endpoint/path
+        ep_name = parts[1]
+        path = "/".join(parts[2:])
         endpoint = mode_endpoints.get(ep_name)
         if not endpoint:
             return web.json_response(
@@ -124,7 +190,7 @@ class GatewayServer:
                 status=404,
             )
 
-        return await self._proxy_request(request, endpoint, path)
+        return await self._proxy_request(request, endpoint, path, billing_mode=mode)
 
     # ------------------------------------------------------------------
     # Proxy handler
@@ -149,7 +215,14 @@ class GatewayServer:
 
         return await self._proxy_request(request, endpoint, path)
 
-    async def _proxy_request(self, request: web.Request, endpoint: EndpointConfig, path: str) -> web.StreamResponse:
+    async def _proxy_request(
+        self,
+        request: web.Request,
+        endpoint: EndpointConfig,
+        path: str,
+        billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> web.StreamResponse:
         """Core proxy logic shared by both standard and mode-aware handlers."""
         body = await request.read()
         original_model = self._extract_model(body)
@@ -167,7 +240,7 @@ class GatewayServer:
                 endpoint, backend["id"], body, original_model
             )
             try:
-                return await self._forward(request, backend, path, effective_body, model, fallback_header)
+                return await self._forward(request, backend, path, effective_body, model, fallback_header, billing_mode, metadata)
             except _ProxyError as e:
                 last_err = e
                 self.health.record_error(backend["id"], e.status)
@@ -306,6 +379,8 @@ class GatewayServer:
         body: bytes,
         model: str = "",
         fallback_header: str = "",
+        billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         assert self._session is not None
 
@@ -366,9 +441,9 @@ class GatewayServer:
         is_streaming = "text/event-stream" in content_type
 
         if is_streaming:
-            return await self._stream(request, resp, backend, original_model, fallback_header)
+            return await self._stream(request, resp, backend, original_model, fallback_header, elapsed_ms, billing_mode, metadata, body)
         else:
-            return await self._respond(resp, backend, original_model, elapsed_ms, fallback_header)
+            return await self._respond(resp, backend, original_model, elapsed_ms, fallback_header, billing_mode, metadata, body)
 
     async def _respond(
         self,
@@ -377,6 +452,9 @@ class GatewayServer:
         original_model: str,
         elapsed_ms: int,
         fallback_header: str = "",
+        billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
+        request_body: bytes | None = None,
     ) -> web.Response:
         resp_body = await upstream.read()
         upstream.release()
@@ -410,11 +488,13 @@ class GatewayServer:
             response_body=resp_body,
             original_model=original_model,
             elapsed_ms=elapsed_ms,
+            billing_mode=billing_mode,
+            metadata=metadata,
         )
 
-        for h in ("x-request-id", "openai-organization", "anthropic-ratelimit-requests-remaining"):
-            if h in upstream.headers:
-                response.headers[h] = upstream.headers[h]
+        self._dump_api_call(request_body, resp_body, original_model, backend["id"], elapsed_ms)
+
+        _forward_upstream_headers(upstream.headers, response.headers)
         response.headers["x-gateway-backend"] = backend["id"]
         response.headers["x-gateway-ms"] = str(elapsed_ms)
         if fallback_header:
@@ -428,8 +508,13 @@ class GatewayServer:
         backend: dict[str, Any],
         original_model: str,
         fallback_header: str = "",
+        elapsed_ms: int = 0,
+        billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
+        request_body: bytes | None = None,
     ) -> web.StreamResponse:
         needs_translate = backend["translate"] == "anthropic-to-openai"
+        dump_chunks: list[bytes] | None = [] if self._dump_dir is not None else None
 
         if needs_translate:
             resp = web.StreamResponse()
@@ -452,6 +537,8 @@ class GatewayServer:
 
             try:
                 async for translated in openai_sse_to_anthropic_sse(_chunks(), original_model):
+                    if dump_chunks is not None:
+                        dump_chunks.append(translated)
                     await resp.write(translated)
             finally:
                 upstream.release()
@@ -464,26 +551,38 @@ class GatewayServer:
                         output_tokens=usage["output_tokens"],
                         cache_creation_input_tokens=usage["cache_creation_input_tokens"],
                         cache_read_input_tokens=usage["cache_read_input_tokens"],
+                        billing_mode=billing_mode,
+                        metadata=metadata,
+                    )
+                if dump_chunks is not None:
+                    self._dump_api_call(
+                        request_body, b"".join(dump_chunks) or None,
+                        original_model, backend["id"], elapsed_ms,
                     )
             return resp
         else:
             resp = web.StreamResponse()
+            _forward_upstream_headers(upstream.headers, resp.headers)
             resp.content_type = "text/event-stream"
             resp.headers["Cache-Control"] = "no-cache"
             resp.headers["Connection"] = "keep-alive"
             resp.headers["x-gateway-backend"] = backend["id"]
             if fallback_header:
                 resp.headers["x-gateway-model-fallback"] = fallback_header
-            for h in ("x-request-id", "openai-organization"):
-                if h in upstream.headers:
-                    resp.headers[h] = upstream.headers[h]
             await resp.prepare(request)
 
             try:
                 async for chunk in upstream.content.iter_any():
+                    if dump_chunks is not None:
+                        dump_chunks.append(chunk)
                     await resp.write(chunk)
             finally:
                 upstream.release()
+                if dump_chunks is not None:
+                    self._dump_api_call(
+                        request_body, b"".join(dump_chunks) or None,
+                        original_model, backend["id"], elapsed_ms,
+                    )
             return resp
 
     # ------------------------------------------------------------------
@@ -619,6 +718,46 @@ class GatewayServer:
 
         return json.dumps(data).encode()
 
+    def _dump_api_call(
+        self,
+        request_body: bytes | None,
+        response_body: bytes | None,
+        model: str,
+        backend_id: str,
+        elapsed_ms: int,
+    ) -> None:
+        """Dump request+response JSON to GATEWAY_DUMP_DIR. Failures must never break the proxy."""
+        if self._dump_dir is None or not request_body:
+            return
+        try:
+            now = datetime.now(timezone.utc)
+            ts_iso = now.isoformat().replace("+00:00", "Z")
+            file_name = ts_iso.replace(":", "-").replace(".", "-") + ".json"
+            file_path = self._dump_dir / file_name
+            try:
+                request: Any = json.loads(request_body)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                request = request_body.decode("utf-8", errors="replace")
+            response: Any = None
+            if response_body:
+                text = response_body.decode("utf-8", errors="replace")
+                try:
+                    response = json.loads(text)
+                except json.JSONDecodeError:
+                    response = text
+            dump: dict[str, Any] = {
+                "ts": ts_iso,
+                "model": model or None,
+                "backend": backend_id,
+                "latency_ms": elapsed_ms,
+                "request": request,
+            }
+            if response is not None:
+                dump["response"] = response
+            file_path.write_text(json.dumps(dump) + "\n", encoding="utf-8")
+        except Exception:  # noqa: BLE001 — dump failure should never break the proxy
+            logger.debug("Failed to dump API call", exc_info=True)
+
     def _record_stream_usage(
         self,
         *,
@@ -628,6 +767,8 @@ class GatewayServer:
         output_tokens: int,
         cache_creation_input_tokens: int = 0,
         cache_read_input_tokens: int = 0,
+        billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> None:
         model = original_model or f"{self._infer_provider_from_backend(backend, original_model)}/unknown"
         provider = self._infer_provider_from_backend(backend, model)
@@ -652,6 +793,8 @@ class GatewayServer:
             latency_ms=0,
             fallback=":fb:" in backend["id"],
             cost=cost,
+            billing_mode=billing_mode or self.config.mode,
+            metadata=metadata,
         )
 
     def _record_usage_if_possible(
@@ -661,6 +804,8 @@ class GatewayServer:
         response_body: bytes,
         original_model: str,
         elapsed_ms: int,
+        billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> None:
         try:
             payload = json.loads(response_body)
@@ -711,6 +856,8 @@ class GatewayServer:
             latency_ms=elapsed_ms,
             fallback=":fb:" in backend["id"],
             cost=cost,
+            billing_mode=billing_mode or self.config.mode,
+            metadata=metadata,
         )
 
     @staticmethod
