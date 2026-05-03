@@ -1,6 +1,6 @@
 # input: gateway config, auth rules, aiohttp upstream requests, pricing, upload config/uploader helpers, and optional GATEWAY_DUMP_DIR env
 # output: local gateway HTTP endpoints, proxied upstream responses, usage accounting, optional usage upload, and optional request+response JSON dumps
-# pos: SDK gateway runtime that fronts upstream providers with health/fallback, usage collection, and optional dump of full API call payloads to GATEWAY_DUMP_DIR
+# pos: SDK gateway runtime that fronts upstream providers with health/fallback, usage collection, hot config reload, and optional dump of full API call payloads to GATEWAY_DUMP_DIR
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 """Gateway HTTP server — transparent proxy with failover and key rotation."""
@@ -65,7 +65,13 @@ def _forward_upstream_headers(upstream_headers: Any, target: Any) -> None:
 
 
 class GatewayServer:
-    def __init__(self, config: GatewayConfig, pid_file: str | None = None):
+    def __init__(
+        self,
+        config: GatewayConfig,
+        pid_file: str | None = None,
+        config_path: str | Path | None = None,
+        watch_config: bool = True,
+    ):
         self.config = config
         self.health = HealthTracker()
         self.usage = UsageTracker(uploader=UsageUploader(get_config()))
@@ -73,10 +79,78 @@ class GatewayServer:
         self._session: aiohttp.ClientSession | None = None
         self._key_idx: dict[str, int] = {}  # round-robin counters
         self._pid_file: Path | None = Path(pid_file) if pid_file else None
+        self._config_path: Path | None = Path(config_path) if config_path else None
+        self._watch_config: bool = watch_config and self._config_path is not None
+        self._watcher_task: asyncio.Task[None] | None = None
         dump_dir_env = os.environ.get("GATEWAY_DUMP_DIR") or None
         self._dump_dir: Path | None = Path(dump_dir_env) if dump_dir_env else None
         if self._dump_dir is not None:
             self._dump_dir.mkdir(parents=True, exist_ok=True)
+
+    def reload_config(self, new_config: GatewayConfig) -> None:
+        """Hot-swap gateway configuration in place.
+
+        Preserves bound host/port and the health/usage trackers; resets the
+        round-robin key index. Falls back to a still-available mode if the
+        active mode disappears.
+        """
+        if new_config.host != self.config.host or new_config.port != self.config.port:
+            logger.warning(
+                "host/port change ignored on reload (already bound to %s:%s)",
+                self.config.host, self.config.port,
+            )
+        new_config.host = self.config.host
+        new_config.port = self.config.port
+
+        if not new_config.endpoint_modes:
+            new_config.endpoint_modes = {new_config.mode or "default": new_config.endpoints or {}}
+
+        available_modes = list(new_config.endpoint_modes.keys())
+        desired_mode = self.config.mode
+        if desired_mode in new_config.endpoint_modes:
+            active_mode = desired_mode
+        else:
+            active_mode = available_modes[0] if available_modes else "default"
+        new_config.mode = active_mode
+        new_config.endpoints = new_config.endpoint_modes.get(active_mode, {})
+
+        self.config = new_config
+        self._key_idx = {}
+        logger.info("Config reloaded")
+        # Schedule a follow-up health pre-check so newly listed models get probed.
+        try:
+            asyncio.get_running_loop().create_task(self._apply_global_model_health_precheck())
+        except RuntimeError:
+            # No running loop (e.g. called from sync context) — skip silently.
+            pass
+
+    async def _config_watcher_loop(self, interval: float = 1.0) -> None:
+        """Poll the config file's mtime and trigger reload_config() on change."""
+        if self._config_path is None:
+            return
+        path = self._config_path
+        try:
+            last_mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            last_mtime = None
+        logger.info("Watching config file for changes: %s", path)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    mtime = path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if last_mtime is not None and mtime == last_mtime:
+                    continue
+                last_mtime = mtime
+                try:
+                    new_config = GatewayConfig.load(path)
+                    self.reload_config(new_config)
+                except Exception as e:  # noqa: BLE001 — bad config must never crash gateway
+                    logger.error("Config reload failed for %s: %s", path, e)
+        except asyncio.CancelledError:
+            return
 
     async def run(self):
         self._session = aiohttp.ClientSession(
@@ -104,6 +178,9 @@ class GatewayServer:
         self._write_pid_file()
         self._print_banner()
 
+        if self._watch_config and self._config_path is not None:
+            self._watcher_task = asyncio.create_task(self._config_watcher_loop())
+
         shutdown_event = asyncio.Event()
         self._install_signal_handlers(shutdown_event)
 
@@ -113,6 +190,13 @@ class GatewayServer:
         except (KeyboardInterrupt, SystemExit):
             pass
         finally:
+            if self._watcher_task is not None:
+                self._watcher_task.cancel()
+                try:
+                    await self._watcher_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._watcher_task = None
             self._remove_pid_file()
             if self._session:
                 await self._session.close()
@@ -411,6 +495,15 @@ class GatewayServer:
 
         if body and (backend["model_map"] or backend["model_prefix"]):
             upstream_body = self._map_model(upstream_body, backend)
+
+        # DeepSeek: inject empty thinking blocks for assistant messages that lack them.
+        # DeepSeek API requires every assistant message in a multi-turn conversation to
+        # carry its reasoning_content (even if empty). When the upstream returns
+        # thinking="" the client may drop it; the gateway restores it before forwarding.
+        if (billing_mode and "deepseek" in billing_mode
+                and upstream_body
+                and self._has_thinking_enabled(upstream_body)):
+            upstream_body = self._ensure_thinking_blocks(upstream_body)
 
         t0 = time.monotonic()
         try:
@@ -717,6 +810,62 @@ class GatewayServer:
             data["model"] = backend["model_prefix"] + model
 
         return json.dumps(data).encode()
+
+    @staticmethod
+    def _has_thinking_enabled(body: bytes) -> bool:
+        """Check whether the request has Anthropic extended thinking enabled.
+
+        Looks for the ``thinking`` top-level field with type ``"enabled"`` or ``"auto"``.
+        """
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        thinking = data.get("thinking")
+        if not isinstance(thinking, dict):
+            return False
+        return thinking.get("type") in ("enabled", "auto")
+
+    @staticmethod
+    def _ensure_thinking_blocks(body: bytes) -> bytes:
+        """Inject empty thinking blocks for assistant messages that lack them.
+
+        DeepSeek API requires every assistant message in a multi-turn conversation to
+        carry its reasoning_content (even when empty). If the client dropped an empty
+        thinking block, re-inject it so the upstream doesn't reject the request.
+        """
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return body
+
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return body
+
+        modified = False
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+
+            if any(b.get("type") == "thinking" for b in content if isinstance(b, dict)):
+                continue
+
+            first_text_idx = None
+            for i, b in enumerate(content):
+                if isinstance(b, dict) and b.get("type") == "text":
+                    first_text_idx = i
+                    break
+            if first_text_idx is None:
+                continue
+
+            content.insert(first_text_idx, {"type": "thinking", "thinking": ""})
+            modified = True
+
+        return json.dumps(data).encode() if modified else body
 
     def _dump_api_call(
         self,

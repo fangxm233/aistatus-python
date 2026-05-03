@@ -15,6 +15,7 @@ def start(
     auto: bool = False,
     pid_file: str | None = None,
     log_file: str | None = None,
+    watch_config: bool = True,
 ):
     """Start the gateway server."""
     try:
@@ -39,20 +40,29 @@ def start(
             format="%(asctime)s %(name)s %(levelname)s %(message)s",
         )
 
-    from .config import GatewayConfig
+    from pathlib import Path as _Path
+
+    from .config import CONFIG_FILE, GatewayConfig
     from .server import GatewayServer
 
+    resolved_config_path: _Path | None
     if auto:
         config = GatewayConfig.auto_discover(host=host, port=port)
+        resolved_config_path = None
     elif config_path:
-        from pathlib import Path as _Path
-
-        config = GatewayConfig.load(_Path(config_path))
+        resolved_config_path = _Path(config_path)
+        config = GatewayConfig.load(resolved_config_path)
     else:
+        resolved_config_path = CONFIG_FILE
         config = GatewayConfig.load()
 
     config.host = host
     config.port = port
 
-    server = GatewayServer(config, pid_file=pid_file)
+    server = GatewayServer(
+        config,
+        pid_file=pid_file,
+        config_path=resolved_config_path,
+        watch_config=watch_config,
+    )
     asyncio.run(server.run())
