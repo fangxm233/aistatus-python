@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.0.5 — 2026-04-26
+
+Client reuse, gateway observability, hot-reload, identity hardening, and concurrency safety across the SDK.
+
+### Gateway
+
+- **Per-request URL metadata** — `/m/{mode}/{metadata?}/{endpoint}/{path}` route now accepts an optional metadata segment: comma-separated `key=value` pairs (e.g. `/m/prod/agent=cortex,task=42/openai/v1/chat/completions`). Metadata is URL-decoded and threaded through to usage records, surfacing in `/usage` responses and uploads. Route matching tries the 4-segment form first, falling back to the legacy 3-segment form.
+- **`GATEWAY_DUMP_DIR` full-call auditing** — set the `GATEWAY_DUMP_DIR` environment variable to write a JSON dump of every proxied request+response to that directory (one `{timestamp}.json` per call). Covers streaming (chunks accumulated alongside real-time forwarding), non-streaming, and translate-path streaming. Dump failures silently degrade — they never break the proxy.
+- **Upstream header forwarding** — response headers from upstream providers are now forwarded wholesale (minus RFC 7230 hop-by-hop headers and `x-gateway-*` namespace), replacing the previous hardcoded allowlist of `x-request-id` / `openai-organization` / `anthropic-ratelimit-requests-remaining`.
+- **Health endpoint auth** — `/health` now respects gateway auth config, returning 401 unless the path is listed in `public_paths`.
+- **Translate-path stream usage recording** — when the gateway translates streaming responses (Anthropic↔OpenAI protocol bridge), usage is now extracted from accumulated SSE chunks and recorded via the usage tracker. Previously, translate-path streaming usage was silently lost.
+- **Config hot-reload** — `GatewayServer.reload_config()` swaps the full gateway configuration in place without dropping the HTTP server, preserving bound host/port and in-memory health/usage trackers. `_config_watcher_loop()` polls the config file's mtime every 1s and triggers reload on change. The watcher is wired into `gateway.start()` by default; opt out with `watch_config=False`.
+- **DeepSeek thinking block injection** — when Anthropic extended thinking is enabled and the upstream is DeepSeek, the gateway now injects empty `thinking` blocks into assistant messages that lack them (`_ensure_thinking_blocks()`). DeepSeek requires `reasoning_content` on every assistant turn in multi-turn conversations; clients that strip empty `thinking=""` blocks would otherwise get 400 errors.
+
+### Provider Adapters — Client Reuse
+
+All provider adapters now cache SDK client instances, only rebuilding when the API key or base URL changes. This eliminates per-request client construction overhead and reuses HTTP connection pools.
+
+- **Anthropic** (`anthropic_.py`) — caches `anthropic.Anthropic` / `AsyncAnthropic` keyed on API key. Multiple system-role messages are now joined with `"\n\n"` instead of only keeping the last one.
+- **OpenAI** (`openai_.py`) — caches `openai.OpenAI` / `AsyncOpenAI` with a composite key of `(api_key, base_url, default_headers_tuple)`.
+- **Google** (`google_.py`) — caches `genai.Client` keyed on API key. `http_options.timeout` is now set from the SDK-level `timeout` parameter (previously ignored).
+- **Compatible providers** (`compatible_.py`) — new `_CachedCompatibleMixin` class that caches clients for DeepSeek, Mistral, xAI, Groq, Together, MoonshotAI, and Qwen. All share a single `_resolve_api_key()` helper.
+
+### API Client
+
+- **`StatusAPI`** — now caches `httpx.Client` / `httpx.AsyncClient` instances instead of creating one per request (`async with httpx.AsyncClient(...)` → instance reuse). Adds `close()` and `aclose()` methods with `atexit` cleanup. Client instances are lazily created on first use.
+
+### Usage & Upload
+
+- **Shared thread pool executor** — `UsageUploader` replaces per-upload `threading.Thread(daemon=True).start()` with a class-level `ThreadPoolExecutor(max_workers=2, thread_name_prefix="aistatus-upload")`, initialized once via double-checked locking. Submissions use `executor.submit()`; the executor is registered for `atexit` shutdown with `wait=False`.
+- **Identity field truncation** — `name` (200 chars), `organization` (200 chars), and `email` (254 chars) are now truncated in upload payloads to prevent oversized requests.
+- **Metadata in usage records** — `UsageTracker.record_usage()` accepts an optional `metadata: dict[str, str]` parameter. Non-reserved keys are merged into the usage record and fanned out through both local storage and the uploader.
+- **Locked JSONL appends** — `UsageStorage.append()` now acquires `fcntl.LOCK_EX` before writing and releases with `LOCK_UN` afterward, making concurrent writes from multiple processes safe.
+- **Local timezone for "today"** — `period_since("today")` now computes midnight in the local timezone instead of UTC, so daily usage summaries align with the user's calendar day.
+
+### Pricing
+
+- **Atomic cache writes** — `_write_file_cache()` now writes to a temp file via `tempfile.mkstemp()` then calls `os.replace()` for atomic rename, preventing corruption when multiple processes write concurrently.
+
+### Router
+
+- **Non-streaming usage recording** — `route_stream()` now records usage for both code paths: the direct streaming path (accumulating usage from chunks) and the non-streaming fallback (when the adapter lacks `acall_stream`). Previously, only the streaming path recorded.
+- **System message dedup** — when both the `system` parameter and the messages array contain a system-role message, duplicates are now merged (prepended with `"\n\n"`) instead of inserted twice.
+- **429 retry hardening** — retry path now respects `allow_fallback`: when retry fails and fallback is disabled, raises `ProviderCallFailed` instead of silently continuing. Added `log.warning()` on retry failure.
+
+### Protocol Translation
+
+- **Non-text content warnings** — `anthropic_request_to_openai()` now logs a warning when non-text content blocks are dropped during Anthropic→OpenAI translation, and emits a `"[Unsupported non-text content omitted …]"` placeholder in the output message.
+- **Input tokens in terminal SSE** — `message_delta` terminal events now include `input_tokens` alongside `output_tokens` in the `usage` field.
+- **SSE finished guard** — a `finished` flag prevents emitting duplicate terminal events when both `[DONE]` and `finish_reason` arrive in the same stream.
+
+### Health Tracker
+
+- **Smarter cooldown clearing** — `record_success()` now only clears the cooldown when there are no recent errors within the sliding window, preventing a single success from prematurely reactivating a flapping backend.
+
+### Config
+
+- **Thread-safe singleton** — `get_config()` now uses double-checked locking (`threading.Lock()`) for safe concurrent access.
+
 ## 0.0.4 — 2026-04-04
 
 Opt-in usage upload pipeline and cache-aware pricing for the leaderboard flow.
