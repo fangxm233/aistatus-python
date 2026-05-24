@@ -12,11 +12,31 @@ from .auth import GatewayAuthConfig
 CONFIG_DIR = Path.home() / ".aistatus"
 CONFIG_FILE = CONFIG_DIR / "gateway.yaml"
 
-# Default base URLs (without trailing /v1 — the SDK path includes it)
+# Top-level YAML keys reserved for gateway configuration (not endpoint names).
+# Everything else under the YAML root is treated as an endpoint identifier — this lets users
+# route arbitrary PI provider names (xai / github-copilot / kimi-coding / etc.) through the
+# gateway without bumping a code-level allowlist on every new provider.
+RESERVED_KEYS = frozenset({
+    "host",
+    "port",
+    "mode",
+    "auth",
+    "status_check",
+    "endpoint_modes",
+    "endpoints",
+})
+
+# Default base URLs for built-in providers. Endpoints not listed here must supply `base_url` in YAML.
 DEFAULT_BASE_URLS = {
     "anthropic": "https://api.anthropic.com",
     "openai": "https://api.openai.com",
     "google": "https://generativelanguage.googleapis.com",
+    # OpenAI Codex uses the ChatGPT backend (OAuth bearer to a ChatGPT Plus/Pro subscription),
+    # NOT api.openai.com (which is the separately-billed Platform API).
+    # PI source: node_modules/@mariozechner/pi-ai/dist/providers/openai-codex-responses.js
+    #   `const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api"`
+    "openai-codex": "https://chatgpt.com/backend-api",
+    "deepseek": "https://api.deepseek.com",
 }
 
 # How each endpoint type sends authentication
@@ -28,11 +48,15 @@ AUTH_STYLES: dict[str, tuple[str, str]] = {
     "google": ("x-goog-api-key", ""),
 }
 
-# Env var → endpoint mapping for auto-discovery
+# Env var → endpoint mapping for auto-discovery. Only static-API-key providers are listed here;
+# OAuth-subscription providers (openai-codex, github-copilot, google-gemini-cli, google-antigravity,
+# etc.) intentionally do NOT appear because they require an OAuth bearer that lives in the caller's
+# own auth store — there is no static API-key equivalent to discover from the environment.
 AUTO_DISCOVER_MAP = {
     "ANTHROPIC_API_KEY": "anthropic",
     "OPENAI_API_KEY": "openai",
     "GEMINI_API_KEY": "google",
+    "DEEPSEEK_API_KEY": "deepseek",
 }
 
 # Known OpenAI-compatible fallback providers
@@ -172,7 +196,9 @@ class GatewayConfig:
         endpoint_modes: dict[str, dict[str, EndpointConfig]] = {}
         discovered_modes: list[str] = []
 
-        for ep_name in ("anthropic", "openai", "google"):
+        for ep_name in raw:
+            if ep_name in RESERVED_KEYS:
+                continue
             ep_raw = raw.get(ep_name)
             if not ep_raw or not isinstance(ep_raw, dict):
                 continue
@@ -352,6 +378,23 @@ openai:
     #   model_map:
     #     gpt-4o: deepseek-chat
     #     gpt-4o-mini: deepseek-chat
+
+# ── OpenAI Codex (ChatGPT Plus/Pro OAuth subscription) ───────────
+# Codex uses OAuth bearer tokens tied to a ChatGPT subscription, NOT a static
+# API key. The gateway transparently passes through the caller's own bearer
+# token; no managed keys are set here.
+openai-codex:
+  base_url: https://chatgpt.com/backend-api
+  auth_style: bearer
+  passthrough: true
+
+# ── DeepSeek ──────────────────────────────────────────────────────
+deepseek:
+  keys:
+    - $DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  auth_style: bearer
+  passthrough: true
 
 # ── Google (for Gemini CLI) ─────────────────────────────────────
 # google:

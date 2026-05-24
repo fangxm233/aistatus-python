@@ -291,13 +291,26 @@ class GatewayServer:
         path = request.match_info["path"]
 
         endpoint = self.config.endpoints.get(ep_name)
+        billing_mode: str | None = None
+
+        if not endpoint:
+            # Auto-discover: search all other modes for the requested endpoint
+            for mode_name, mode_endpoints in self.config.endpoint_modes.items():
+                if mode_name == self.config.mode:
+                    continue
+                found = mode_endpoints.get(ep_name)
+                if found:
+                    endpoint = found
+                    billing_mode = mode_name
+                    break
+
         if not endpoint:
             return web.json_response(
                 {"error": {"message": f"Unknown endpoint: {ep_name}", "type": "gateway_error"}},
                 status=404,
             )
 
-        return await self._proxy_request(request, endpoint, path)
+        return await self._proxy_request(request, endpoint, path, billing_mode=billing_mode)
 
     async def _proxy_request(
         self,
