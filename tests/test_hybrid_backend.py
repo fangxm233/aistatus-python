@@ -165,12 +165,12 @@ class TestHybridBackendSelection:
             passthrough=True,
         )
         server = _make_server(ep)
-        # Mark managed key as unhealthy
-        server.health.record_error("openai:key:0", 429)
-        server.health.record_error("openai:key:0", 429)
-        server.health.record_error("openai:key:0", 429)
-        server.health.record_error("openai:key:0", 429)
-        server.health.record_error("openai:key:0", 429)
+        # Mark managed key as unhealthy (5xx triggers cooldown)
+        server.health.record_error("openai:key:0", 500)
+        server.health.record_error("openai:key:0", 500)
+        server.health.record_error("openai:key:0", 500)
+        server.health.record_error("openai:key:0", 500)
+        server.health.record_error("openai:key:0", 500)
 
         request = _make_request("Bearer sk-caller")
         backends = server._build_backend_list(ep, request)

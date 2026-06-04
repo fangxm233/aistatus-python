@@ -1,14 +1,19 @@
 """Health tracking for gateway backends.
 
 Tracks per-backend error rates using a sliding window + cooldown mechanism.
-When a backend returns 429 / 5xx, it is marked unhealthy for a cooldown period.
+Only 5xx errors trigger cooldowns — these indicate genuine backend health issues
+(server errors, overload). 4xx errors (notably 429 rate-limit) are NOT health
+problems: the backend is reachable and functioning, the caller's quota is
+exhausted. Treating 429 as unhealthy caused a cascade where a harmless quota-
+check probe (max_tokens=1, content="quota") would blackhole the backend for 30s,
+causing all subsequent real requests to 503 "All backends unavailable".
 
 Supports dual-layer tracking:
 - Backend level: is_healthy("anthropic:key:0")
 - Model level: is_healthy("anthropic:key:0", model="claude-opus-4-6")
 
 Model-level and backend-level health are independent. A model-specific error
-(e.g. opus rate-limited) does not mark the backend unhealthy, and vice versa.
+(e.g. opus overloaded) does not mark the backend unhealthy, and vice versa.
 """
 
 from __future__ import annotations
@@ -18,15 +23,25 @@ from collections import deque
 from dataclasses import dataclass, field
 
 
-# Cooldown durations (seconds) by HTTP status
+# Cooldown durations (seconds) by HTTP status.
+# Only 5xx errors trigger cooldowns. 4xx errors (rate limits, auth, bad request)
+# are caller-side and must NOT affect backend health tracking.
 _COOLDOWNS = {
-    429: 30,   # rate-limited → back off 30s
     500: 15,
     502: 10,
     503: 10,
     529: 30,   # Anthropic overloaded
 }
 _DEFAULT_COOLDOWN = 10
+
+
+def is_server_error(status: int) -> bool:
+    """Return True if the status code represents a server-side health issue.
+
+    4xx errors are caller-side (rate limits, auth, bad request) and must NOT
+    affect backend health tracking.
+    """
+    return status >= 500
 
 # Sliding window for error rate tracking
 _WINDOW_SIZE = 60  # seconds
@@ -72,12 +87,29 @@ class HealthTracker:
     def record_error(self, backend_id: str, status_code: int, *, model: str | None = None):
         s = self._get_state(backend_id, model)
         now = time.monotonic()
+        s.total_requests += 1
+
+        # 4xx errors (rate limits, auth failures, bad requests) are caller-side —
+        # the backend is healthy and reachable. Only 5xx errors affect health/cooldown.
+        if not is_server_error(status_code):
+            return
+
         s.errors.append(now)
         s.total_errors += 1
-        s.total_requests += 1
 
         cooldown = _COOLDOWNS.get(status_code, _DEFAULT_COOLDOWN)
         s.cooldown_until = max(s.cooldown_until, now + cooldown)
+
+    def soonest_cooldown(self, backend_ids: list[str]) -> tuple[str, float] | None:
+        """Return the backend whose cooldown expires soonest (seconds from now, 0 if healthy)."""
+        best: tuple[str, float] | None = None
+        now = time.monotonic()
+        for bid in backend_ids:
+            s = self._state.get(bid)
+            remaining = max(0.0, s.cooldown_until - now) if s else 0.0
+            if best is None or remaining < best[1]:
+                best = (bid, remaining)
+        return best
 
     def record_success(self, backend_id: str, *, model: str | None = None):
         s = self._get_state(backend_id, model)

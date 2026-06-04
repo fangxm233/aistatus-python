@@ -335,7 +335,7 @@ class TestModelHealthOnError:
 
     @pytest.mark.asyncio
     async def test_error_records_model_health(self):
-        """429 error records both backend and model level health."""
+        """5xx error records both backend and model level health."""
         ep = EndpointConfig(
             name="anthropic",
             base_url="https://api.anthropic.com",
@@ -348,9 +348,9 @@ class TestModelHealthOnError:
         body = json.dumps({"model": "claude-opus-4-6", "max_tokens": 100}).encode()
         request = _make_request(body=body, endpoint="anthropic")
 
-        # Mock _forward to raise _ProxyError (simulating upstream 429)
+        # Mock _forward to raise _ProxyError (simulating upstream 503)
         with patch.object(server, "_forward", new_callable=AsyncMock) as mock_forward:
-            mock_forward.side_effect = _ProxyError(429, b'{"error": "rate limited"}')
+            mock_forward.side_effect = _ProxyError(503, b'{"error": "service unavailable"}')
             result = await server._handle_proxy(request)
 
         # Backend-level error recorded
@@ -358,6 +358,29 @@ class TestModelHealthOnError:
 
         # Model-level error recorded
         assert server.health.error_count("anthropic:key:0", model="claude-opus-4-6") == 1
+
+    @pytest.mark.asyncio
+    async def test_429_error_does_not_record_health(self):
+        """429 error does NOT record health — it's a caller-side rate limit, not a backend issue."""
+        ep = EndpointConfig(
+            name="anthropic",
+            base_url="https://api.anthropic.com",
+            auth_style="bearer",
+            keys=["sk-managed"],
+            passthrough=False,
+        )
+        server = _make_server(ep)
+
+        body = json.dumps({"model": "claude-opus-4-6", "max_tokens": 100}).encode()
+        request = _make_request(body=body, endpoint="anthropic")
+
+        with patch.object(server, "_forward", new_callable=AsyncMock) as mock_forward:
+            mock_forward.side_effect = _ProxyError(429, b'{"error": "rate limited"}')
+            result = await server._handle_proxy(request)
+
+        # 429 is 4xx — no health errors recorded
+        assert server.health.error_count("anthropic:key:0") == 0
+        assert server.health.error_count("anthropic:key:0", model="claude-opus-4-6") == 0
 
     @pytest.mark.asyncio
     async def test_error_without_model_skips_model_health(self):
@@ -375,7 +398,7 @@ class TestModelHealthOnError:
         request = _make_request(body=body, endpoint="anthropic")
 
         with patch.object(server, "_forward", new_callable=AsyncMock) as mock_forward:
-            mock_forward.side_effect = _ProxyError(429, b'{"error": "rate limited"}')
+            mock_forward.side_effect = _ProxyError(503, b'{"error": "service unavailable"}')
             result = await server._handle_proxy(request)
 
         # Backend-level error recorded

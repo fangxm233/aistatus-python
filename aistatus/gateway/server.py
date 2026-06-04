@@ -325,11 +325,19 @@ class GatewayServer:
         original_model = self._extract_model(body)
         backends = self._build_backend_list(endpoint, request)
 
+        # When all backends are in cooldown, pick the one whose cooldown expires
+        # soonest and try it anyway. This prevents a single transient 5xx from
+        # blackholing all traffic for the full cooldown window — the retry may
+        # succeed if the upstream recovered.
         if not backends:
-            return web.json_response(
-                {"error": {"message": "All backends unavailable", "type": "gateway_error"}},
-                status=503,
-            )
+            fallback_backend = self._pick_soonest_cooldown_backend(endpoint, request)
+            if fallback_backend:
+                backends = [fallback_backend]
+            else:
+                return web.json_response(
+                    {"error": {"message": "All backends unavailable", "type": "gateway_error"}},
+                    status=503,
+                )
 
         last_err: _ProxyError | None = None
         for backend in backends:
@@ -438,6 +446,57 @@ class GatewayServer:
             })
 
         return backends
+
+    def _pick_soonest_cooldown_backend(
+        self, endpoint: EndpointConfig, request: web.Request
+    ) -> dict[str, Any] | None:
+        """Last-resort fallback when all backends are in cooldown.
+
+        Enumerates every possible backend for the endpoint and returns the one
+        whose cooldown expires soonest. This avoids an instant 503 when a single
+        transient error marked the only backend unhealthy — the retry often
+        succeeds because the upstream has already recovered.
+        """
+        ep = endpoint.name
+        candidates: list[tuple[str, dict[str, Any]]] = []
+
+        # Managed keys
+        for i, key in enumerate(endpoint.keys):
+            bid = f"{ep}:key:{i}"
+            candidates.append((bid, self._primary_backend(bid, endpoint, key)))
+
+        # Passthrough
+        if not endpoint.keys or endpoint.passthrough:
+            bid = f"{ep}:passthrough"
+            incoming_key = self._extract_incoming_key(request, endpoint.auth_style)
+            if incoming_key:
+                candidates.append((bid, self._primary_backend(bid, endpoint, incoming_key)))
+
+        # Fallbacks
+        for fb in endpoint.fallbacks:
+            if not fb.api_key:
+                continue
+            bid = f"{ep}:fb:{fb.name}"
+            candidates.append((bid, {
+                "id": bid,
+                "base_url": fb.base_url,
+                "api_key": fb.api_key,
+                "auth_style": fb.auth_style,
+                "model_prefix": fb.model_prefix,
+                "model_map": fb.model_map,
+                "translate": fb.translate,
+            }))
+
+        if not candidates:
+            return None
+
+        best = self.health.soonest_cooldown([bid for bid, _ in candidates])
+        if not best:
+            return candidates[0][1]
+        for bid, backend in candidates:
+            if bid == best[0]:
+                return backend
+        return None
 
     @staticmethod
     def _primary_backend(

@@ -1,6 +1,6 @@
-# input: pytest, unittest.mock time patching, and aistatus.gateway.health HealthTracker
-# output: regression tests for dual-layer health tracking and cooldown clearing behavior
-# pos: validates backend/model health state transitions, summaries, and cooldown persistence rules
+# input: pytest, unittest.mock time patching, and aistatus.gateway.health HealthTracker / is_server_error
+# output: regression tests for dual-layer health tracking, 4xx/5xx classification, cooldown clearing, and soonest_cooldown fallback
+# pos: validates backend/model health state transitions, summaries, cooldown persistence rules, and the 4xx-is-not-unhealthy invariant
 # >>> 一旦我被更新，务必更新我的开头注释，以及所属文件夹的 CLAUDE.md <<<
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 from unittest.mock import patch
 
-from aistatus.gateway.health import HealthTracker
+from aistatus.gateway.health import HealthTracker, is_server_error
 
 
 class TestModelHealthIndependence:
@@ -33,9 +33,9 @@ class TestModelHealthIndependence:
         ht = HealthTracker()
         bid = "anthropic:key:0"
 
-        # Record 5 backend-level errors
+        # Record 5 backend-level errors (5xx — triggers cooldown)
         for _ in range(5):
-            ht.record_error(bid, 429)
+            ht.record_error(bid, 500)
 
         # Backend is unhealthy
         assert not ht.is_healthy(bid)
@@ -76,9 +76,9 @@ class TestModelHealthRecordError:
         ht = HealthTracker()
         bid = "anthropic:key:0"
 
-        ht.record_error(bid, 429, model="claude-opus-4-6")
-        ht.record_error(bid, 429, model="claude-opus-4-6")
-        ht.record_error(bid, 429, model="claude-sonnet-4-6")
+        ht.record_error(bid, 503, model="claude-opus-4-6")
+        ht.record_error(bid, 503, model="claude-opus-4-6")
+        ht.record_error(bid, 503, model="claude-sonnet-4-6")
 
         assert ht.error_count(bid, model="claude-opus-4-6") == 2
         assert ht.error_count(bid, model="claude-sonnet-4-6") == 1
@@ -105,8 +105,8 @@ class TestModelHealthRecordSuccess:
         ht = HealthTracker()
         bid = "anthropic:key:0"
 
-        # Backend-level error
-        ht.record_error(bid, 429)
+        # Backend-level error (5xx triggers cooldown)
+        ht.record_error(bid, 500)
         assert not ht.is_healthy(bid)
 
         # Model-level success
@@ -124,7 +124,7 @@ class TestModelHealthBackwardCompat:
         ht = HealthTracker()
         bid = "anthropic:key:0"
 
-        ht.record_error(bid, 429)
+        ht.record_error(bid, 500)
         assert ht.error_count(bid) == 1
 
     def test_no_model_is_healthy_same_as_before(self):
@@ -134,7 +134,7 @@ class TestModelHealthBackwardCompat:
 
         assert ht.is_healthy(bid)
         for _ in range(5):
-            ht.record_error(bid, 429)
+            ht.record_error(bid, 500)
         assert not ht.is_healthy(bid)
 
 
@@ -144,7 +144,7 @@ class TestModelHealthBackwardCompat:
 
         with patch("aistatus.gateway.health.time") as mock_time:
             mock_time.monotonic.return_value = 100.0
-            ht.record_error(bid, 429)
+            ht.record_error(bid, 500)
             assert not ht.is_healthy(bid)
 
             mock_time.monotonic.return_value = 101.0
@@ -186,7 +186,7 @@ class TestModelHealthSummary:
         ht = HealthTracker()
         bid = "anthropic:key:0"
 
-        ht.record_error(bid, 429)
+        ht.record_error(bid, 500)
         ht.record_success(bid)
 
         s = ht.summary()
@@ -217,3 +217,68 @@ class TestModelHealthWindowBehavior:
             # Now check health at a time after the window expired
             mock_time.monotonic.return_value = 200.0  # 100s later, window is 60s
             assert ht.is_healthy(bid, model="claude-opus-4-6")
+
+
+class TestIsServerError:
+    """is_server_error correctly classifies 4xx vs 5xx."""
+
+    def test_4xx_codes_are_not_server_errors(self):
+        for code in (400, 401, 403, 404, 429):
+            assert not is_server_error(code), f"{code} should not be a server error"
+
+    def test_5xx_codes_are_server_errors(self):
+        for code in (500, 502, 503, 529):
+            assert is_server_error(code), f"{code} should be a server error"
+
+
+class TestFourXXDoesNotAffectHealth:
+    """429 and other 4xx errors must not trigger cooldowns."""
+
+    def test_429_does_not_mark_backend_unhealthy(self):
+        ht = HealthTracker()
+        bid = "a:key:0"
+        assert ht.is_healthy(bid)
+
+        ht.record_error(bid, 429)
+        # 429 is 4xx — backend stays healthy
+        assert ht.is_healthy(bid)
+        # No server-side error recorded
+        assert ht.error_count(bid) == 0
+
+    def test_429_at_model_level_does_not_affect_model_health(self):
+        ht = HealthTracker()
+        bid = "a:key:0"
+        ht.record_error(bid, 429, model="claude-opus")
+        assert ht.is_healthy(bid, model="claude-opus")
+
+    def test_5xx_marks_backend_unhealthy(self):
+        ht = HealthTracker()
+        bid = "a:key:0"
+        assert ht.is_healthy(bid)
+
+        ht.record_error(bid, 500)
+        assert not ht.is_healthy(bid)
+        assert ht.error_count(bid) == 1
+
+
+class TestSoonestCooldown:
+    """soonest_cooldown picks the backend closest to recovery."""
+
+    def test_picks_shortest_cooldown(self):
+        ht = HealthTracker()
+        ht.record_error("a:key:0", 503)  # 10s cooldown
+        ht.record_error("b:key:0", 500)  # 15s cooldown
+
+        best = ht.soonest_cooldown(["a:key:0", "b:key:0"])
+        assert best is not None
+        bid, remaining = best
+        assert bid == "a:key:0"
+        assert 0 < remaining <= 10
+
+    def test_returns_zero_for_healthy_backend(self):
+        ht = HealthTracker()
+        # Never errored — should be 0 remaining
+        best = ht.soonest_cooldown(["a:key:0"])
+        assert best is not None
+        _, remaining = best
+        assert remaining == 0.0
