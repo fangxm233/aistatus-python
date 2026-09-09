@@ -8,7 +8,7 @@ Tests are written to validate gateway features before implementation changes.
 |---|---|---|
 | `test_hybrid_backend.py` | regression | Verify backend ordering, config parsing, and status reporting |
 | `test_proxy_model_extraction.py` | regression | Verify model extraction, fallback headers, translate-stream usage tracking, and translation warnings |
-| `test_usage_endpoint.py` | regression | Verify `/usage` HTTP endpoint summaries and validation |
+| `test_usage_endpoint.py` | regression | Verify `/usage` HTTP endpoint summaries, validation, and `format=records` listing with since/limit/offset paging |
 | `test_pricing.py` | regression | Verify pricing lookup handles versioned Claude IDs, base aliases, and atomic cache writes |
 | `test_model_health.py` | regression | Verify `HealthTracker` backend/model dual-layer behavior and cooldown persistence |
 | `test_graceful_shutdown.py` | regression | Verify signal handling and PID cleanup |
@@ -20,3 +20,4 @@ Tests are written to validate gateway features before implementation changes.
 | `test_stream_usage.py` | regression | Verify streaming responses are accounted end-to-end across Anthropic / chat-completions / Responses SSE, with real latency, metadata and async pricing |
 | `gateway_harness.py` | fixture | Shared end-to-end harness: a live fake upstream behind a live gateway, with stubbed pricing, returning the usage rows a round trip produced |
 | `test_codex_responses.py` | regression | Verify OpenAI Responses/Codex accounting (cached-input split, model recovered from the stream) and content-type body probing |
+| `test_quota.py` | regression | Verify quota header parsing (both windows, 429 rejection), snapshot validation and persistence, `/quota`, and the passthrough-only observation gate |

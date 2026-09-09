@@ -221,6 +221,88 @@ class TestUsageValidation:
 
 
 # -----------------------------------------------------------------------
+# /usage?format=records
+# -----------------------------------------------------------------------
+
+class TestUsageRecordsFormat:
+    """`format=records` returns raw rows instead of a summary, for tools that aggregate themselves."""
+
+    @pytest.mark.asyncio
+    async def test_returns_raw_records(self, tmp_path):
+        server = _make_server(tmp_path)
+        _seed_usage(server)
+
+        response = await server._handle_usage(_make_request({"format": "records"}))
+        payload = json.loads(response.body)
+
+        assert len(payload["records"]) == 3
+        assert {record["model"] for record in payload["records"]} == {
+            "claude-opus-4-6", "claude-sonnet-4-6", "gpt-4o",
+        }
+
+    @pytest.mark.asyncio
+    async def test_paginates_with_limit_and_offset(self, tmp_path):
+        server = _make_server(tmp_path)
+        _seed_usage(server)
+        everything = json.loads(
+            (await server._handle_usage(_make_request({"format": "records"}))).body
+        )["records"]
+
+        page = json.loads((await server._handle_usage(
+            _make_request({"format": "records", "limit": "2", "offset": "1"})
+        )).body)["records"]
+
+        assert page == everything[1:3]
+
+    @pytest.mark.asyncio
+    async def test_limit_zero_means_no_ceiling(self, tmp_path):
+        server = _make_server(tmp_path)
+        _seed_usage(server)
+
+        payload = json.loads((await server._handle_usage(
+            _make_request({"format": "records", "limit": "0"})
+        )).body)
+        assert len(payload["records"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_since_filters_by_timestamp(self, tmp_path):
+        server = _make_server(tmp_path)
+        _seed_usage(server)
+        everything = json.loads(
+            (await server._handle_usage(_make_request({"format": "records"}))).body
+        )["records"]
+
+        after_first = json.loads((await server._handle_usage(
+            _make_request({"format": "records", "since": everything[0]["ts"]})
+        )).body)["records"]
+
+        # `since` is exclusive, so the record whose timestamp was used drops out.
+        assert everything[0] not in after_first
+        assert len(after_first) < len(everything)
+
+    @pytest.mark.asyncio
+    async def test_unparseable_since_is_ignored_rather_than_rejected(self, tmp_path):
+        server = _make_server(tmp_path)
+        _seed_usage(server)
+
+        payload = json.loads((await server._handle_usage(
+            _make_request({"format": "records", "since": "not-a-date"})
+        )).body)
+        assert len(payload["records"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_invalid_period_is_not_validated_in_records_mode(self, tmp_path):
+        # `period` does not apply to record listing, so it must not trigger the summary validator.
+        server = _make_server(tmp_path)
+        _seed_usage(server)
+
+        response = await server._handle_usage(
+            _make_request({"format": "records", "period": "nonsense"})
+        )
+        assert response.status == 200
+
+
+# -----------------------------------------------------------------------
 # UsageStorage: "today" period
 # -----------------------------------------------------------------------
 

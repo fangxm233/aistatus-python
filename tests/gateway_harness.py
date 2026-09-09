@@ -18,6 +18,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from aistatus.gateway.config import EndpointConfig, GatewayConfig
+from aistatus.gateway.quota_snapshot import QuotaSnapshotStore
 from aistatus.gateway.server import GatewayServer
 from aistatus.usage import UsageTracker
 from aistatus.usage_storage import UsageStorage
@@ -102,6 +103,8 @@ async def proxy_once(
     server.usage = UsageTracker(storage=storage)
     pricing = StubPricing()
     server.pricing = pricing
+    # Keep the suite off the real ~/.aistatus/quota.json.
+    server.quota = QuotaSnapshotStore(tmp_path / "quota.json")
 
     client = TestClient(TestServer(server.create_app()))
     await client.start_server()

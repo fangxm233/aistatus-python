@@ -30,6 +30,7 @@ from ..config import get_config
 from .auth import check_gateway_auth
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
+from .quota_snapshot import QuotaSnapshotStore
 from .stream_usage import StreamUsageParser, parse_usage_response, probe_upstream_body
 from .usage_accounting import record_gateway_usage
 
@@ -66,6 +67,39 @@ def _forward_upstream_headers(upstream_headers: Any, target: Any) -> None:
         target[key] = value
 
 
+def _query_int(value: str | None, default: int) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _filter_usage_since(
+    records: list[dict[str, Any]], since: str | None
+) -> list[dict[str, Any]]:
+    """Keep records strictly newer than `since`. An unparseable bound is ignored, not an error."""
+    if not since:
+        return records
+    try:
+        bound = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    except ValueError:
+        return records
+    if bound.tzinfo is None:
+        bound = bound.replace(tzinfo=timezone.utc)
+
+    kept = []
+    for record in records:
+        try:
+            ts = datetime.fromisoformat(str(record.get("ts", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts > bound:
+            kept.append(record)
+    return kept
+
+
 class GatewayServer:
     def __init__(
         self,
@@ -78,6 +112,7 @@ class GatewayServer:
         self.health = HealthTracker()
         self.usage = UsageTracker(uploader=UsageUploader(get_config()))
         self.pricing = CostCalculator()
+        self.quota = QuotaSnapshotStore()
         self._session: aiohttp.ClientSession | None = None
         self._key_idx: dict[str, int] = {}  # round-robin counters
         self._pid_file: Path | None = Path(pid_file) if pid_file else None
@@ -162,6 +197,7 @@ class GatewayServer:
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/status", self._handle_status)
         app.router.add_get("/usage", self._handle_usage)
+        app.router.add_get("/quota", self._handle_quota)
         app.router.add_post("/mode", self._handle_mode_switch)
         # Per-request mode routing: /m/{mode}/{metadata?}/{endpoint}/{path}
         app.router.add_route("*", "/m/{tail:.*}", self._handle_mode_dispatch)
@@ -610,6 +646,7 @@ class GatewayServer:
         self.health.record_success(backend["id"])
         if model:
             self.health.record_success(backend["id"], model=model)
+        self._observe_quota(resp, backend, billing_mode)
 
         content_type = resp.headers.get("content-type", "")
         if "text/event-stream" in content_type:
@@ -997,6 +1034,7 @@ class GatewayServer:
             )
         return web.json_response({
             "status": "ok",
+            "mode": self.config.mode,
             "endpoints": list(self.config.endpoints.keys()),
         })
 
@@ -1050,6 +1088,9 @@ class GatewayServer:
                 status=401,
             )
 
+        if request.query.get("format") == "records":
+            return self._usage_records_response(request)
+
         period = request.query.get("period", "today")
         group_by = request.query.get("group_by", "")
 
@@ -1075,6 +1116,42 @@ class GatewayServer:
             result["providers"] = self.usage.by_provider(period=period)
 
         return web.json_response(result)
+
+    def _usage_records_response(self, request: web.Request) -> web.Response:
+        """Return raw usage rows, newest file order, with `since` / `limit` / `offset` paging."""
+        records = _filter_usage_since(self.usage.storage.read("all"), request.query.get("since"))
+        limit = max(0, _query_int(request.query.get("limit"), 1000))
+        offset = max(0, _query_int(request.query.get("offset"), 0))
+        paged = records[offset : offset + limit] if limit > 0 else records[offset:]
+        return web.json_response({"records": paged})
+
+    async def _handle_quota(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response(
+                {"error": {"message": "Unauthorized", "type": "gateway_error"}},
+                status=401,
+            )
+        return web.json_response({"providers": self.quota.list(request.query.get("provider"))})
+
+    def _observe_quota(
+        self, upstream: aiohttp.ClientResponse, backend: dict[str, Any], billing_mode: str | None
+    ) -> None:
+        """Capture Anthropic's rate-limit headers.
+
+        Only OAuth passthrough traffic is read: the unified rate-limit headers describe a
+        subscription's quota, so a managed API key's response says nothing about it.
+        """
+        backend_id = backend.get("id", "")
+        if not backend_id.startswith("anthropic:") or not backend_id.endswith(":passthrough"):
+            return
+        if backend.get("auth_style") != "bearer":
+            return
+        self.quota.observe(
+            upstream.headers,
+            provider="anthropic",
+            mode=billing_mode or self.config.mode,
+            status=upstream.status,
+        )
 
     # ------------------------------------------------------------------
     # Signal handling
