@@ -23,3 +23,4 @@ Tests are written to validate gateway features before implementation changes.
 | `test_quota.py` | regression | Verify quota header parsing (both windows, 429 rejection), snapshot validation and persistence, `/quota`, and the passthrough-only observation gate |
 | `test_stream_abort.py` | regression | Verify an upstream that dies mid-stream aborts the client connection and records no usage, while one that dies after its terminal event counts as complete |
 | `test_websocket_proxy.py` | regression | Verify WebSocket tunnelling, auth and extension header handling, one usage row per completed response on a pooled socket, and the refusal paths (upstream 401, disabled, unknown endpoint, no backend) |
+| `test_usage_index.py` | regression | Verify cached usage-file parsing stays correct across appends and external writes, that `report()` matches the separate queries, and that a warm read does no file IO |

@@ -132,6 +132,12 @@ class UsageTracker:
 
     def summary(self, period: str = "month", all_projects: bool = False) -> dict[str, Any]:
         records = self.storage.read(period=period, all_projects=all_projects)
+        return self._summarize(records, period, all_projects)
+
+    @staticmethod
+    def _summarize(
+        records: list[dict[str, Any]], period: str, all_projects: bool
+    ) -> dict[str, Any]:
         total_requests = len(records)
         total_input = sum(int(r.get("in", 0) or 0) for r in records)
         total_output = sum(int(r.get("out", 0) or 0) for r in records)
@@ -159,10 +165,18 @@ class UsageTracker:
         return self._group_by("model", period, all_projects)
 
     def cost_breakdown(self, period: str = "month", all_projects: bool = False) -> dict[str, Any]:
+        return self.report(period=period, all_projects=all_projects)
+
+    def report(self, period: str = "month", all_projects: bool = False) -> dict[str, Any]:
+        """Summary plus provider and model breakdowns, from a single pass over the records.
+
+        Asking for the three separately re-read and re-aggregated the same rows three times.
+        """
+        records = self.storage.read(period=period, all_projects=all_projects)
         return {
-            "summary": self.summary(period=period, all_projects=all_projects),
-            "providers": self.by_provider(period=period, all_projects=all_projects),
-            "models": self.by_model(period=period, all_projects=all_projects),
+            "summary": self._summarize(records, period, all_projects),
+            "providers": self._aggregate(records, "provider"),
+            "models": self._aggregate(records, "model"),
         }
 
     def export_csv(self, output_path: str, period: str = "month", all_projects: bool = False) -> None:
@@ -177,6 +191,11 @@ class UsageTracker:
         self.storage.export_json(payload, output_path)
 
     def _group_by(self, key: str, period: str, all_projects: bool) -> list[dict[str, Any]]:
+        records = self.storage.read(period=period, all_projects=all_projects)
+        return self._aggregate(records, key)
+
+    @staticmethod
+    def _aggregate(records: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
         buckets: dict[str, dict[str, Any]] = defaultdict(lambda: {
             key: "",
             "requests": 0,
@@ -188,7 +207,7 @@ class UsageTracker:
         })
         latency_sums: dict[str, int] = defaultdict(int)
 
-        for record in self.storage.read(period=period, all_projects=all_projects):
+        for record in records:
             bucket_key = str(record.get(key, "unknown"))
             bucket = buckets[bucket_key]
             bucket[key] = bucket_key

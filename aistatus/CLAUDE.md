@@ -19,8 +19,8 @@ Public imports are exposed from `__init__.py`, while internal modules implement 
 | `config.py` | upload config | Persist and resolve SDK upload identity/config from runtime, env, and file sources |
 | `uploader.py` | upload bridge | Build sanitized usage upload payloads and POST them asynchronously through a shared executor |
 | `router.py` | routing engine | Route requests across providers with fallback logic and config-backed usage upload |
-| `usage.py` | usage tracker | Record request usage, aggregate summaries, and fan out records to the uploader |
-| `usage_storage.py` | persistence | Store and read usage records on disk with locked JSONL appends |
+| `usage.py` | usage tracker | Record request usage, aggregate summaries (`report()` does all three breakdowns in one pass), and fan out records to the uploader |
+| `usage_storage.py` | persistence | Store and read usage records on disk with locked JSONL appends, reusing parsed files while their size and mtime are unchanged |
 | `cli/` | CLI package | Subcommands and command-line integration |
 | `providers/` | provider adapters | Integrate Anthropic, OpenAI, Google, and other backends with cached client reuse where needed |
 | `gateway/` | gateway package | Local HTTP gateway server, config, and health tracking |

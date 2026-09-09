@@ -21,6 +21,9 @@ class UsageStorage:
         self._project_dir = self._resolve_project_dir()
         self._project_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_manifest()
+        #: path -> (mtime_ns, size, parsed records). Aggregation reads the same month files over
+        #: and over, and re-parsing them each time is the dominant cost of a usage query.
+        self._parse_cache: dict[Path, tuple[int, int, list[dict[str, Any]]]] = {}
 
     def append(self, record: dict[str, Any]) -> None:
         month_file = self._project_dir / f"{self._month_key(record.get('ts'))}.jsonl"
@@ -97,6 +100,31 @@ class UsageStorage:
         since: datetime | None,
         project_dir: Path,
     ) -> list[dict[str, Any]]:
+        records = self._parsed_file(file_path, project_dir)
+        if since is None:
+            return list(records)
+        # A record whose timestamp cannot be read is dropped rather than assumed in range.
+        return [
+            record
+            for record in records
+            if (ts := self._parse_ts(record.get("ts"))) is not None and ts >= since
+        ]
+
+    def _parsed_file(self, file_path: Path, project_dir: Path) -> list[dict[str, Any]]:
+        """Parse one JSONL file, reusing the previous parse while the file is unchanged.
+
+        Usage files are append-only, so a matching size and mtime means the parse still holds.
+        Callers get the cached dicts themselves and must treat them as read-only.
+        """
+        try:
+            stat = file_path.stat()
+        except OSError:
+            return []
+
+        cached = self._parse_cache.get(file_path)
+        if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+
         records: list[dict[str, Any]] = []
         for line in file_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -105,12 +133,20 @@ class UsageStorage:
                 record = json.loads(line)
             except Exception:
                 continue
-            ts = self._parse_ts(record.get("ts"))
-            if since and (ts is None or ts < since):
-                continue
             record.setdefault("project", project_dir.name)
             records.append(record)
+
+        self._parse_cache[file_path] = (stat.st_mtime_ns, stat.st_size, records)
         return records
+
+    def prewarm(self, all_projects: bool = False) -> int:
+        """Parse every usage file up front so a later query does no file IO. Returns record count."""
+        project_dirs = self._all_project_dirs() if all_projects else [self._project_dir]
+        total = 0
+        for project_dir in project_dirs:
+            for file_path in sorted(project_dir.glob("*.jsonl")):
+                total += len(self._parsed_file(file_path, project_dir))
+        return total
 
     @staticmethod
     def _month_key(ts: Any) -> str:
