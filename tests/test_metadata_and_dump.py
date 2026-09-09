@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aistatus.gateway.config import EndpointConfig, GatewayConfig
+from aistatus.gateway.routing import resolve_proxy_route
 from aistatus.gateway.server import GatewayServer
 from aistatus.usage import UsageTracker
 from aistatus.usage_storage import UsageStorage
@@ -40,6 +41,66 @@ class TestParseUrlMetadata:
 
     def test_returns_empty_dict_for_empty_input(self):
         assert GatewayServer._parse_url_metadata("") == {}
+
+
+# -----------------------------------------------------------------------
+# Test: resolve_proxy_route
+# -----------------------------------------------------------------------
+
+class TestResolveProxyRoute:
+    """The pure router shared by HTTP proxying and WebSocket upgrades."""
+
+    MODES = {
+        "plan": {"anthropic": object(), "openai": object()},
+        "api": {"anthropic": object()},
+    }
+
+    def test_four_segment_form_carries_metadata(self):
+        route = resolve_proxy_route(
+            "/m/plan/project=dex-hand,trigger=dispatch/anthropic/v1/messages", self.MODES
+        )
+        assert (route.kind, route.mode, route.ep_name, route.path) == (
+            "route", "plan", "anthropic", "v1/messages",
+        )
+        assert route.metadata == {"project": "dex-hand", "trigger": "dispatch"}
+
+    def test_three_segment_form_has_no_metadata(self):
+        route = resolve_proxy_route("/m/plan/anthropic/v1/messages", self.MODES)
+        assert (route.kind, route.mode, route.ep_name, route.path) == (
+            "route", "plan", "anthropic", "v1/messages",
+        )
+        assert route.metadata is None
+
+    def test_ambiguous_path_prefers_the_three_segment_reading(self):
+        # `/m/plan/anthropic/v1/messages` could parse either way; the four-segment reading is only
+        # taken when its third segment really names an endpoint in that mode ("v1" does not).
+        route = resolve_proxy_route("/m/plan/anthropic/v1/messages", self.MODES)
+        assert route.ep_name == "anthropic"
+
+    def test_metadata_segment_that_names_an_endpoint_wins(self):
+        route = resolve_proxy_route("/m/plan/project=x/openai/v1/chat", self.MODES)
+        assert (route.ep_name, route.path) == ("openai", "v1/chat")
+        assert route.metadata == {"project": "x"}
+
+    def test_plain_endpoint_form(self):
+        route = resolve_proxy_route("/anthropic/v1/messages", self.MODES)
+        assert (route.kind, route.ep_name, route.path, route.mode) == (
+            "route", "anthropic", "v1/messages", "",
+        )
+
+    def test_unknown_mode_is_distinct_from_not_found(self):
+        # They are different status codes to the caller: 400 versus 404.
+        assert resolve_proxy_route("/m/nope/anthropic/v1", self.MODES).kind == "unknown-mode"
+        assert resolve_proxy_route("/m/plan/anthropic", self.MODES).kind == "not-found"
+
+    def test_endpoint_missing_from_the_mode_still_resolves_for_the_caller_to_reject(self):
+        route = resolve_proxy_route("/m/api/openai/v1/chat", self.MODES)
+        assert route.kind == "route"
+        assert route.ep_name == "openai"
+        assert route.ep_name not in self.MODES["api"]
+
+    def test_empty_path(self):
+        assert resolve_proxy_route("/", self.MODES).kind == "not-found"
 
 
 # -----------------------------------------------------------------------

@@ -14,7 +14,7 @@ Tests are written to validate gateway features before implementation changes.
 | `test_graceful_shutdown.py` | regression | Verify signal handling and PID cleanup |
 | `test_config.py` | regression | Verify SDK upload config defaults, file/env precedence, and configure() persistence |
 | `test_uploader.py` | regression | Verify uploader field limits, executor usage, router streaming usage, API/provider client caching, and targeted retry/provider regressions |
-| `test_metadata_and_dump.py` | regression | Verify URL metadata parsing, UsageTracker metadata pass-through with reserved-key filtering, mode-dispatch routing, and GATEWAY_DUMP_DIR request+response dumps |
+| `test_metadata_and_dump.py` | regression | Verify `resolve_proxy_route` resolution, URL metadata parsing, UsageTracker metadata pass-through with reserved-key filtering, mode-dispatch routing, and GATEWAY_DUMP_DIR request+response dumps |
 | `test_config_reload.py` | regression | Verify `GatewayServer.reload_config()` swaps endpoints/mode in place, pins host/port, and the file-mtime watcher loop reloads on edits and survives invalid YAML |
 | `test_body_limit.py` | regression | Verify the configurable request body cap: 100 MB default, 413 above a configured limit, and reserved-key parsing |
 | `test_stream_usage.py` | regression | Verify streaming responses are accounted end-to-end across Anthropic / chat-completions / Responses SSE, with real latency, metadata and async pricing |
@@ -22,3 +22,4 @@ Tests are written to validate gateway features before implementation changes.
 | `test_codex_responses.py` | regression | Verify OpenAI Responses/Codex accounting (cached-input split, model recovered from the stream) and content-type body probing |
 | `test_quota.py` | regression | Verify quota header parsing (both windows, 429 rejection), snapshot validation and persistence, `/quota`, and the passthrough-only observation gate |
 | `test_stream_abort.py` | regression | Verify an upstream that dies mid-stream aborts the client connection and records no usage, while one that dies after its terminal event counts as complete |
+| `test_websocket_proxy.py` | regression | Verify WebSocket tunnelling, auth and extension header handling, one usage row per completed response on a pooled socket, and the refusal paths (upstream 401, disabled, unknown endpoint, no backend) |

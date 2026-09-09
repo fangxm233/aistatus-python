@@ -14,7 +14,6 @@ import os
 import signal
 import time
 from datetime import datetime, timezone
-from urllib.parse import unquote
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +30,14 @@ from .auth import check_gateway_auth
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
 from .quota_snapshot import QuotaSnapshotStore
+from .routing import parse_url_metadata, resolve_proxy_route
 from .stream_usage import StreamUsageParser, parse_usage_response, probe_upstream_body
 from .usage_accounting import record_gateway_usage
+from .websocket_proxy import (
+    WebSocketProxy,
+    to_websocket_url,
+    upstream_handshake_headers,
+)
 
 logger = logging.getLogger("aistatus.gateway")
 
@@ -65,6 +70,13 @@ def _forward_upstream_headers(upstream_headers: Any, target: Any) -> None:
         if lower.startswith("x-gateway-"):
             continue
         target[key] = value
+
+
+def _is_websocket_upgrade(request: web.Request) -> bool:
+    return (
+        request.headers.get("upgrade", "").lower() == "websocket"
+        and "upgrade" in request.headers.get("connection", "").lower()
+    )
 
 
 def _query_int(value: str | None, default: int) -> int:
@@ -265,12 +277,7 @@ class GatewayServer:
 
     @staticmethod
     def _parse_url_metadata(raw: str) -> dict[str, str]:
-        result: dict[str, str] = {}
-        for pair in raw.split(","):
-            eq_idx = pair.find("=")
-            if eq_idx > 0:
-                result[unquote(pair[:eq_idx])] = unquote(pair[eq_idx + 1:])
-        return result
+        return parse_url_metadata(raw)
 
     async def _handle_mode_dispatch(self, request: web.Request) -> web.StreamResponse:
         """Handle per-request mode routing with optional metadata: /m/{mode}/{metadata?}/{endpoint}/{path}."""
@@ -281,45 +288,29 @@ class GatewayServer:
             )
 
         tail = request.match_info["tail"]
-        parts = tail.split("/", 3)
+        route = resolve_proxy_route(f"/m/{tail}", self.config.endpoint_modes)
 
-        if len(parts) < 3:
+        if route.kind == "unknown-mode":
+            return web.json_response(
+                {"error": {"message": f"Unknown mode: {route.mode}", "type": "gateway_error"}},
+                status=400,
+            )
+        if route.kind != "route":
             return web.json_response(
                 {"error": {"message": f"Invalid mode path: /m/{tail}", "type": "gateway_error"}},
                 status=404,
             )
 
-        mode = parts[0]
-        mode_endpoints = self.config.endpoint_modes.get(mode)
-        if not mode_endpoints:
-            return web.json_response(
-                {"error": {"message": f"Unknown mode: {mode}", "type": "gateway_error"}},
-                status=400,
-            )
-
-        metadata: dict[str, str] | None = None
-
-        # Try 4-segment: mode/metadata/endpoint/path
-        if len(parts) >= 4:
-            ep_candidate = parts[2]
-            if ep_candidate in mode_endpoints:
-                metadata = self._parse_url_metadata(parts[1])
-                ep_name = ep_candidate
-                path = parts[3] if len(parts) > 3 else ""
-                endpoint = mode_endpoints[ep_name]
-                return await self._proxy_request(request, endpoint, path, billing_mode=mode, metadata=metadata)
-
-        # 3-segment: mode/endpoint/path
-        ep_name = parts[1]
-        path = "/".join(parts[2:])
-        endpoint = mode_endpoints.get(ep_name)
+        endpoint = self.config.endpoint_modes[route.mode].get(route.ep_name)
         if not endpoint:
             return web.json_response(
-                {"error": {"message": f"Unknown endpoint '{ep_name}' in mode '{mode}'", "type": "gateway_error"}},
+                {"error": {"message": f"Unknown endpoint '{route.ep_name}' in mode '{route.mode}'", "type": "gateway_error"}},
                 status=404,
             )
 
-        return await self._proxy_request(request, endpoint, path, billing_mode=mode)
+        return await self._proxy_request(
+            request, endpoint, route.path, billing_mode=route.mode, metadata=route.metadata,
+        )
 
     # ------------------------------------------------------------------
     # Proxy handler
@@ -366,6 +357,9 @@ class GatewayServer:
         metadata: dict[str, str] | None = None,
     ) -> web.StreamResponse:
         """Core proxy logic shared by both standard and mode-aware handlers."""
+        if _is_websocket_upgrade(request):
+            return await self._proxy_websocket(request, endpoint, path, billing_mode, metadata)
+
         body = await request.read()
         original_model = self._extract_model(body)
         backends = self._build_backend_list(endpoint, request)
@@ -449,6 +443,65 @@ class GatewayServer:
     # ------------------------------------------------------------------
     # Backend selection
     # ------------------------------------------------------------------
+
+    async def _proxy_websocket(
+        self,
+        request: web.Request,
+        endpoint: EndpointConfig,
+        path: str,
+        billing_mode: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> web.StreamResponse:
+        """Tunnel a WebSocket upgrade to the upstream provider, accounting each response.
+
+        Backend selection reuses the HTTP path's, but without its retry loop: a WebSocket
+        handshake cannot be replayed against the next backend once the client has been accepted.
+        """
+        if not self.config.websocket:
+            return web.json_response(
+                {"error": {"message": "WebSocket proxying is disabled", "type": "gateway_error"}},
+                status=501,
+            )
+        assert self._session is not None
+
+        backends = self._build_backend_list(endpoint, request)
+        if not backends:
+            return web.json_response(
+                {"error": {"message": "All backends unavailable", "type": "gateway_error"}},
+                status=503,
+            )
+        backend = backends[0]
+
+        url = to_websocket_url(backend["base_url"], path, request.query_string)
+        headers = upstream_handshake_headers(self._build_upstream_headers(request, backend))
+        proxy = WebSocketProxy(
+            session=self._session,
+            backend=backend,
+            pricing=self.pricing,
+            tracker=self.usage,
+            default_billing_mode=self.config.mode,
+            billing_mode=billing_mode,
+            metadata=metadata,
+        )
+
+        try:
+            return await proxy.run(request, url, headers)
+        except aiohttp.WSServerHandshakeError as error:
+            # Relay the upstream's own refusal rather than inventing one, and do not cool the
+            # backend down: an expired OAuth token is the caller's problem, not the backend's.
+            logger.warning("WebSocket handshake refused by %s: %s", backend["id"], error.status)
+            return web.json_response(
+                {"error": {"message": f"Upstream refused WebSocket upgrade: {error.status}",
+                           "type": "gateway_error"}},
+                status=error.status if 400 <= error.status < 600 else 502,
+            )
+        except aiohttp.ClientError as error:
+            logger.warning("WebSocket connection to %s failed: %s", backend["id"], error)
+            return web.json_response(
+                {"error": {"message": "Upstream WebSocket connection failed",
+                           "type": "gateway_error"}},
+                status=502,
+            )
 
     def _build_backend_list(
         self, endpoint: EndpointConfig, request: web.Request
