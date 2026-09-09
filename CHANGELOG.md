@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.0.8 — 2026-09-08
+
+Parity release with the TypeScript SDK 0.0.8. The gateway was effectively unusable for real
+coding-agent traffic; most of this release is fixing that.
+
+### Fixes — Gateway
+
+- **Request bodies were capped at 1 MiB** — the server was built with a bare `web.Application()`,
+  and aiohttp defaults `client_max_size` to 1048576. A coding agent's system prompt plus
+  accumulated context routinely exceeds that, so ordinary requests were rejected with 413. New
+  `max_body_size_mb` config key, default 100, same as the TypeScript SDK.
+- **Streaming responses were not accounted** — usage was recorded only on the `anthropic-to-openai`
+  translate path, so every anthropic, openai, deepseek and openai-codex stream produced zero usage
+  rows. Even on the translate path the extractor understood only a top-level `usage` object, so it
+  missed Anthropic's `message_start` / `message_delta` (recording input as 0 and dropping cache-read
+  tokens) and returned nothing at all for the OpenAI Responses API. Replaced with a parser covering
+  all three protocols, parsing incrementally rather than buffering the whole response.
+- **Pricing lookups blocked the event loop** — a synchronous `httpx.Client` call from async code
+  could stall the whole gateway for up to 3s per uncached candidate query, and a cold cache silently
+  priced every model's first request at 0. Async variants now use `httpx.AsyncClient` with
+  single-flight dedup so concurrent requests for one model share a single upstream lookup.
+- **Streaming rows recorded `latency_ms` as 0** — they now carry the real time to first byte.
+- **Codex event streams were buffered, not streamed** — the ChatGPT backend labels them
+  `application/json`. Believing that header cost both incremental delivery and all usage
+  accounting. When the header does not say `text/event-stream`, the first chunk now decides.
+- **A cut-off stream looked complete** — an upstream that died mid-response was proxied as if it had
+  ended normally, handing the client a truncated answer and billing the partial token counts. The
+  connection is now torn down unless a terminal event was already seen.
+
+### Features — Gateway
+
+- **WebSocket proxying** — the OpenAI Responses API is also served over WebSocket, and clients using
+  it could not go through the gateway at all. Usage is recorded per completed response, since one
+  pooled socket carries many turns. Controlled by the `websocket` config key (default on).
+- **Quota snapshots and `/quota`** — Anthropic's `anthropic-ratelimit-unified-*` headers report how
+  much of a subscription's 5h and 7d windows is consumed, and the gateway is the only component that
+  sees them. The latest reading per provider is now kept and served.
+- **`/usage?format=records`** — raw rows with `since` / `limit` / `offset` paging.
+- **`/health` reports the active `mode`.**
+
+### Performance
+
+- **Usage queries stopped re-reading their files** — every query re-parsed the whole month file, and
+  `cost_breakdown` did it three times over. Parsed files are reused while unchanged, and the new
+  `UsageTracker.report()` produces the summary and both breakdowns in a single pass.
+
 ## 0.0.7 — 2026-06-04
 
 ### Fixes
