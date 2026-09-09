@@ -26,6 +26,31 @@ def _make_server(endpoint: EndpointConfig) -> GatewayServer:
     return GatewayServer(config)
 
 
+class _ContentStream:
+    """Minimal aiohttp payload-stream stub: one chunk, then EOF."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def readany(self) -> bytes:
+        body, self._body = self._body, b""
+        return body
+
+    async def read(self) -> bytes:
+        body, self._body = self._body, b""
+        return body
+
+
+def _make_upstream(body: bytes, content_type: str = "application/json", status: int = 200):
+    upstream = AsyncMock()
+    upstream.status = status
+    upstream.headers = {"content-type": content_type}
+    upstream.content = _ContentStream(body)
+    upstream.read = AsyncMock(return_value=body)
+    upstream.release = MagicMock()
+    return upstream
+
+
 class _Headers(dict):
     def get(self, key: str, default: str = "") -> str:
         return super().get(key.lower(), default)
@@ -181,11 +206,9 @@ class TestModelHealthOnSuccess:
         )
         server = _make_server(ep)
 
-        upstream = AsyncMock()
-        upstream.read = AsyncMock(return_value=b'{"content": "hello", "usage": {}}')
-        upstream.release = MagicMock()
-        upstream.status = 200
-        upstream.headers = {"content-type": "application/json; charset=utf-8"}
+        upstream = _make_upstream(
+            b'{"content": "hello", "usage": {}}', "application/json; charset=utf-8"
+        )
 
         backend = {
             "id": "anthropic:key:0",
@@ -199,6 +222,7 @@ class TestModelHealthOnSuccess:
 
         response = await server._respond(
             upstream,
+            b'{"content": "hello", "usage": {}}',
             backend,
             "claude-opus-4-6",
             123,
@@ -217,11 +241,7 @@ class TestModelHealthOnSuccess:
         )
         server = _make_server(ep)
 
-        upstream = AsyncMock()
-        upstream.read = AsyncMock(return_value=b'{"content": "hello", "usage": {}}')
-        upstream.release = MagicMock()
-        upstream.status = 200
-        upstream.headers = {"content-type": "application/json"}
+        upstream = _make_upstream(b'{"content": "hello", "usage": {}}')
 
         backend = {
             "id": "anthropic:key:0",
@@ -235,6 +255,7 @@ class TestModelHealthOnSuccess:
 
         response = await server._respond(
             upstream,
+            b'{"content": "hello", "usage": {}}',
             backend,
             "claude-opus-4-6",
             123,
@@ -255,11 +276,7 @@ class TestModelHealthOnSuccess:
         server = _make_server(ep)
         # Need an aiohttp session mock
         mock_session = MagicMock()
-        mock_resp = AsyncMock()
-        mock_resp.status = 200
-        mock_resp.headers = {"content-type": "application/json"}
-        mock_resp.read = AsyncMock(return_value=b'{"content": "hello", "usage": {}}')
-        mock_resp.release = MagicMock()
+        mock_resp = _make_upstream(b'{"content": "hello", "usage": {}}')
         mock_session.request = AsyncMock(return_value=mock_resp)
         server._session = mock_session
 
@@ -298,11 +315,7 @@ class TestModelHealthOnSuccess:
         )
         server = _make_server(ep)
         mock_session = MagicMock()
-        mock_resp = AsyncMock()
-        mock_resp.status = 200
-        mock_resp.headers = {"content-type": "application/json"}
-        mock_resp.read = AsyncMock(return_value=b'{"content": "hello"}')
-        mock_resp.release = MagicMock()
+        mock_resp = _make_upstream(b'{"content": "hello"}')
         mock_session.request = AsyncMock(return_value=mock_resp)
         server._session = mock_session
 

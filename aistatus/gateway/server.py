@@ -30,7 +30,7 @@ from ..config import get_config
 from .auth import check_gateway_auth
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
-from .stream_usage import StreamUsageParser, parse_usage_response
+from .stream_usage import StreamUsageParser, parse_usage_response, probe_upstream_body
 from .usage_accounting import record_gateway_usage
 
 logger = logging.getLogger("aistatus.gateway")
@@ -612,16 +612,19 @@ class GatewayServer:
             self.health.record_success(backend["id"], model=model)
 
         content_type = resp.headers.get("content-type", "")
-        is_streaming = "text/event-stream" in content_type
-
-        if is_streaming:
+        if "text/event-stream" in content_type:
             return await self._stream(request, resp, backend, original_model, fallback_header, elapsed_ms, billing_mode, metadata, body)
-        else:
-            return await self._respond(resp, backend, original_model, elapsed_ms, fallback_header, billing_mode, metadata, body)
+
+        # The ChatGPT Codex backend labels its event streams `application/json`, so the body decides.
+        probe = await probe_upstream_body(resp)
+        if probe.kind == "event-stream":
+            return await self._stream(request, resp, backend, original_model, fallback_header, elapsed_ms, billing_mode, metadata, body, head=probe.head)
+        return await self._respond(resp, probe.body, backend, original_model, elapsed_ms, fallback_header, billing_mode, metadata, body)
 
     async def _respond(
         self,
         upstream: aiohttp.ClientResponse,
+        resp_body: bytes,
         backend: dict[str, Any],
         original_model: str,
         elapsed_ms: int,
@@ -630,7 +633,6 @@ class GatewayServer:
         metadata: dict[str, str] | None = None,
         request_body: bytes | None = None,
     ) -> web.Response:
-        resp_body = await upstream.read()
         upstream.release()
 
         if backend["translate"] == "anthropic-to-openai":
@@ -690,6 +692,7 @@ class GatewayServer:
         billing_mode: str | None = None,
         metadata: dict[str, str] | None = None,
         request_body: bytes | None = None,
+        head: bytes = b"",
     ) -> web.StreamResponse:
         needs_translate = backend["translate"] == "anthropic-to-openai"
         dump_chunks: list[bytes] | None = [] if self._dump_dir is not None else None
@@ -712,6 +715,10 @@ class GatewayServer:
         await resp.prepare(request)
 
         async def _upstream_chunks():
+            # `head` is what the content-type probe already pulled off the stream.
+            if head:
+                parser.push_bytes(head)
+                yield head
             async for chunk in upstream.content.iter_any():
                 parser.push_bytes(chunk)
                 yield chunk

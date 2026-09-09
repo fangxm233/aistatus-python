@@ -215,6 +215,40 @@ class StreamUsageParser:
         )
 
 
+@dataclass
+class BodyProbe:
+    """The verdict of :func:`probe_upstream_body`.
+
+    ``head`` is the bytes already pulled off the stream; a streaming caller must replay it before
+    continuing to read. ``body`` is the whole payload, and is set only for ``kind == "buffered"``.
+    """
+
+    kind: str
+    head: bytes
+    body: bytes = b""
+
+
+async def probe_upstream_body(upstream: Any) -> BodyProbe:
+    """Decide whether an upstream response is really an event stream, by looking at its bytes.
+
+    The ChatGPT Codex backend labels its event streams ``application/json``. Trusting that header
+    buffers the entire stream and hands it to the JSON usage parser, which both destroys the
+    incremental delivery the client asked for and records no usage at all — the bug that kept Codex
+    traffic off the leaderboard.
+    """
+    head = b""
+    while not head:
+        chunk = await upstream.content.readany()
+        if not chunk:
+            break
+        head = chunk
+
+    if looks_like_event_stream(head):
+        return BodyProbe(kind="event-stream", head=head)
+    rest = await upstream.content.read()
+    return BodyProbe(kind="buffered", head=head, body=head + rest)
+
+
 def looks_like_event_stream(head: bytes) -> bool:
     """SSE payloads open with a field name or a comment line (WHATWG event-stream)."""
     start = head[:64].decode("utf-8", errors="ignore").lstrip("﻿ \t\r\n")
