@@ -21,3 +21,4 @@ Tests are written to validate gateway features before implementation changes.
 | `gateway_harness.py` | fixture | Shared end-to-end harness: a live fake upstream behind a live gateway, with stubbed pricing, returning the usage rows a round trip produced |
 | `test_codex_responses.py` | regression | Verify OpenAI Responses/Codex accounting (cached-input split, model recovered from the stream) and content-type body probing |
 | `test_quota.py` | regression | Verify quota header parsing (both windows, 429 rejection), snapshot validation and persistence, `/quota`, and the passthrough-only observation gate |
+| `test_stream_abort.py` | regression | Verify an upstream that dies mid-stream aborts the client connection and records no usage, while one that dies after its terminal event counts as complete |

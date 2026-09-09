@@ -41,6 +41,20 @@ class _ContentStream:
         return body
 
 
+class _ChunkedContent:
+    """Payload-stub that hands out a fixed list of chunks, then EOF."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    async def readany(self) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+    async def read(self) -> bytes:
+        body, self._chunks = b"".join(self._chunks), []
+        return body
+
+
 def _make_upstream(body: bytes, content_type: str = "application/json", status: int = 200):
     upstream = AsyncMock()
     upstream.status = status
@@ -486,17 +500,11 @@ class TestModelHealthInSummary:
 
         upstream = MagicMock()
         upstream.release = MagicMock()
-        upstream.content = type(
-            "Content",
-            (),
-            {
-                "iter_any": staticmethod(lambda: _aiter([
-                    b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n',
-                    b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4}}\n\n',
-                    b'data: [DONE]\n\n',
-                ]))
-            },
-        )()
+        upstream.content = _ChunkedContent([
+            b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}\n\n',
+            b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":4}}\n\n',
+            b'data: [DONE]\n\n',
+        ])
 
         backend = {
             "id": "anthropic:key:0",

@@ -756,41 +756,68 @@ class GatewayServer:
             if head:
                 parser.push_bytes(head)
                 yield head
-            async for chunk in upstream.content.iter_any():
+            while True:
+                try:
+                    chunk = await upstream.content.readany()
+                except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                    raise _UpstreamReadError(str(error)) from error
+                if not chunk:
+                    return
                 parser.push_bytes(chunk)
                 yield chunk
 
+        if needs_translate:
+            from .translate import openai_sse_to_anthropic_sse
+
+            stream = openai_sse_to_anthropic_sse(_upstream_chunks(), original_model)
+        else:
+            stream = _upstream_chunks()
+
+        completed = False
         try:
-            if needs_translate:
-                from .translate import openai_sse_to_anthropic_sse
-
-                stream = openai_sse_to_anthropic_sse(_upstream_chunks(), original_model)
-            else:
-                stream = _upstream_chunks()
-
             async for chunk in stream:
                 if dump_chunks is not None:
                     dump_chunks.append(chunk)
                 await resp.write(chunk)
+            completed = True
+        except _UpstreamReadError:
+            # An upstream that died after its terminal event still delivered a whole response.
+            completed = parser.has_terminal_event()
+            if not completed:
+                logger.warning("Upstream stream interrupted before completion: %s", backend["id"])
         finally:
             upstream.release()
-            if parser.has_usage():
-                await record_gateway_usage(
-                    backend=backend,
-                    usage=parser.usage,
-                    elapsed_ms=elapsed_ms,
-                    pricing=self.pricing,
-                    tracker=self.usage,
-                    billing_mode=billing_mode,
-                    default_billing_mode=self.config.mode,
-                    metadata=metadata,
-                )
-            if dump_chunks is not None:
-                self._dump_api_call(
-                    request_body, b"".join(dump_chunks) or None,
-                    original_model, backend["id"], elapsed_ms,
-                )
+
+        if not completed:
+            # Ending normally would hand the client a truncated stream that looks complete, and
+            # billing the partial counts would record a response that was never delivered.
+            self._abort_stream(request)
+            return resp
+
+        if parser.has_usage():
+            await record_gateway_usage(
+                backend=backend,
+                usage=parser.usage,
+                elapsed_ms=elapsed_ms,
+                pricing=self.pricing,
+                tracker=self.usage,
+                billing_mode=billing_mode,
+                default_billing_mode=self.config.mode,
+                metadata=metadata,
+            )
+        if dump_chunks is not None:
+            self._dump_api_call(
+                request_body, b"".join(dump_chunks) or None,
+                original_model, backend["id"], elapsed_ms,
+            )
         return resp
+
+    @staticmethod
+    def _abort_stream(request: web.Request) -> None:
+        """Tear the connection down so the client sees a failure, not a clean short response."""
+        transport = request.transport
+        if transport is not None:
+            transport.abort()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1227,6 +1254,10 @@ class GatewayServer:
         if len(self.config.endpoint_modes) > 1:
             print(f"  Modes:   {list(self.config.endpoint_modes.keys())}")
         print()
+
+
+class _UpstreamReadError(Exception):
+    """Raised when reading the upstream response body fails partway through."""
 
 
 class _ProxyError(Exception):
