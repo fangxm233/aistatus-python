@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,9 +23,14 @@ RESERVED_KEYS = frozenset({
     "mode",
     "auth",
     "status_check",
+    "max_body_size_mb",
+    "websocket",
     "endpoint_modes",
     "endpoints",
 })
+
+# aiohttp's own default is 1 MiB, which rejects ordinary coding-agent payloads outright.
+DEFAULT_MAX_BODY_SIZE_MB = 100
 
 # Default base URLs for built-in providers. Endpoints not listed here must supply `base_url` in YAML.
 DEFAULT_BASE_URLS = {
@@ -113,6 +119,10 @@ class GatewayConfig:
     host: str = "127.0.0.1"
     port: int = 9880
     status_check: bool = True
+    max_body_size_mb: float = DEFAULT_MAX_BODY_SIZE_MB
+    #: Proxy WebSocket upgrades. False makes the gateway refuse them, so clients that speak
+    #: both transports fall back to SSE over HTTP.
+    websocket: bool = True
     mode: str = "default"
     auth: GatewayAuthConfig | None = None
     endpoints: dict[str, EndpointConfig] = field(default_factory=dict)
@@ -179,6 +189,8 @@ class GatewayConfig:
         host = raw.get("host", "127.0.0.1")
         port = raw.get("port", 9880)
         status_check = raw.get("status_check", True)
+        max_body_size_mb = _parse_max_body_size_mb(raw.get("max_body_size_mb"))
+        websocket = raw.get("websocket") is not False
 
         # Parse auth block
         auth: GatewayAuthConfig | None = None
@@ -227,6 +239,8 @@ class GatewayConfig:
             host=host,
             port=port,
             status_check=status_check,
+            max_body_size_mb=max_body_size_mb,
+            websocket=websocket,
             mode=active_mode,
             auth=auth,
             endpoints=endpoint_modes[active_mode],
@@ -240,6 +254,17 @@ def _is_flat_endpoint_config(value: dict) -> bool:
     """Check if a dict looks like a flat endpoint config (has keys/base_url/etc)."""
     endpoint_keys = {"keys", "base_url", "auth_style", "passthrough", "fallbacks", "model_fallbacks"}
     return any(k in value for k in endpoint_keys)
+
+
+def _parse_max_body_size_mb(value: Any) -> float:
+    """Validate the configured body cap, rejecting values that would silently disable the limit."""
+    if value is None:
+        return DEFAULT_MAX_BODY_SIZE_MB
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("max_body_size_mb must be a finite number greater than zero")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("max_body_size_mb must be a finite number greater than zero")
+    return float(value)
 
 
 def _parse_endpoint_config(ep_name: str, ep_raw: dict[str, Any]) -> EndpointConfig:
@@ -327,6 +352,11 @@ def generate_config() -> str:
 #   python -m aistatus.gateway start --auto
 
 port: 9880
+max_body_size_mb: 100
+
+# Proxy WebSocket upgrades as well as HTTP (default true). Clients that speak both — such as
+# PI's Codex backend — fall back to SSE over HTTP when this is off.
+# websocket: true
 
 # ── Authentication ─────────────────────────────────────────────
 # auth:

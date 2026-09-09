@@ -16,3 +16,5 @@ Tests are written to validate gateway features before implementation changes.
 | `test_uploader.py` | regression | Verify uploader field limits, executor usage, router streaming usage, API/provider client caching, and targeted retry/provider regressions |
 | `test_metadata_and_dump.py` | regression | Verify URL metadata parsing, UsageTracker metadata pass-through with reserved-key filtering, mode-dispatch routing, and GATEWAY_DUMP_DIR request+response dumps |
 | `test_config_reload.py` | regression | Verify `GatewayServer.reload_config()` swaps endpoints/mode in place, pins host/port, and the file-mtime watcher loop reloads on edits and survives invalid YAML |
+| `test_body_limit.py` | regression | Verify the configurable request body cap: 100 MB default, 413 above a configured limit, and reserved-key parsing |
+| `test_stream_usage.py` | regression | Verify streaming responses are accounted end-to-end across Anthropic / chat-completions / Responses SSE, with real latency, metadata and async pricing |

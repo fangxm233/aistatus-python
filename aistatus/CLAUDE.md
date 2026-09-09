@@ -15,7 +15,7 @@ Public imports are exposed from `__init__.py`, while internal modules implement 
 | `stream.py` | stream utilities | collect_stream_text and stream_to_text_chunks async helpers |
 | `exceptions.py` | error model | Define SDK exception types |
 | `models.py` | data model | Define routing/status dataclasses and types |
-| `pricing.py` | pricing lookup | Resolve model pricing and estimate token costs with atomic cache persistence |
+| `pricing.py` | pricing lookup | Resolve model pricing and estimate token costs with atomic cache persistence; async twins (`calculate_cost_*_async`) serve the gateway without blocking its event loop |
 | `config.py` | upload config | Persist and resolve SDK upload identity/config from runtime, env, and file sources |
 | `uploader.py` | upload bridge | Build sanitized usage upload payloads and POST them asynchronously through a shared executor |
 | `router.py` | routing engine | Route requests across providers with fallback logic and config-backed usage upload |

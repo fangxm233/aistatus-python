@@ -30,6 +30,8 @@ from ..config import get_config
 from .auth import check_gateway_auth
 from .config import AUTH_STYLES, EndpointConfig, GatewayConfig
 from .health import HealthTracker
+from .stream_usage import StreamUsageParser, parse_usage_response
+from .usage_accounting import record_gateway_usage
 
 logger = logging.getLogger("aistatus.gateway")
 
@@ -152,15 +154,11 @@ class GatewayServer:
         except asyncio.CancelledError:
             return
 
-    async def run(self):
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300, connect=10),
-            connector=aiohttp.TCPConnector(limit=100),
-        )
-
-        await self._apply_global_model_health_precheck()
-
-        app = web.Application()
+    def create_app(self) -> web.Application:
+        """Build the routed aiohttp application. Split out of :meth:`run` so tests can drive it."""
+        # aiohttp defaults client_max_size to 1 MiB, which 413s ordinary coding-agent payloads.
+        max_body_bytes = int(self.config.max_body_size_mb * 1024 * 1024)
+        app = web.Application(client_max_size=max_body_bytes)
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/status", self._handle_status)
         app.router.add_get("/usage", self._handle_usage)
@@ -169,6 +167,17 @@ class GatewayServer:
         app.router.add_route("*", "/m/{tail:.*}", self._handle_mode_dispatch)
         # Catch-all proxy: /{endpoint}/...
         app.router.add_route("*", "/{endpoint}/{path:.*}", self._handle_proxy)
+        return app
+
+    async def run(self):
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=300, connect=10),
+            connector=aiohttp.TCPConnector(limit=100),
+        )
+
+        await self._apply_global_model_health_precheck()
+
+        app = self.create_app()
 
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
@@ -648,14 +657,18 @@ class GatewayServer:
             charset=charset,
         )
 
-        self._record_usage_if_possible(
-            backend=backend,
-            response_body=resp_body,
-            original_model=original_model,
-            elapsed_ms=elapsed_ms,
-            billing_mode=billing_mode,
-            metadata=metadata,
-        )
+        usage = parse_usage_response(resp_body, original_model)
+        if usage is not None:
+            await record_gateway_usage(
+                backend=backend,
+                usage=usage,
+                elapsed_ms=elapsed_ms,
+                pricing=self.pricing,
+                tracker=self.usage,
+                billing_mode=billing_mode,
+                default_billing_mode=self.config.mode,
+                metadata=metadata,
+            )
 
         self._dump_api_call(request_body, resp_body, original_model, backend["id"], elapsed_ms)
 
@@ -680,75 +693,60 @@ class GatewayServer:
     ) -> web.StreamResponse:
         needs_translate = backend["translate"] == "anthropic-to-openai"
         dump_chunks: list[bytes] | None = [] if self._dump_dir is not None else None
+        # Usage is always read off the UPSTREAM bytes, never the bytes sent to the client: on the
+        # translate path the Anthropic-shaped stream is synthesized locally, and only the OpenAI
+        # original carries the provider's own token counts.
+        parser = StreamUsageParser(original_model)
 
-        if needs_translate:
-            resp = web.StreamResponse()
-            resp.content_type = "text/event-stream"
-            resp.headers["Cache-Control"] = "no-cache"
-            resp.headers["Connection"] = "keep-alive"
-            resp.headers["x-gateway-backend"] = backend["id"]
-            if fallback_header:
-                resp.headers["x-gateway-model-fallback"] = fallback_header
-            await resp.prepare(request)
-
-            from .translate import openai_sse_to_anthropic_sse
-
-            raw_chunks: list[bytes] = []
-
-            async def _chunks():
-                async for chunk in upstream.content.iter_any():
-                    raw_chunks.append(chunk)
-                    yield chunk
-
-            try:
-                async for translated in openai_sse_to_anthropic_sse(_chunks(), original_model):
-                    if dump_chunks is not None:
-                        dump_chunks.append(translated)
-                    await resp.write(translated)
-            finally:
-                upstream.release()
-                usage = self._extract_usage_from_sse(raw_chunks)
-                if usage is not None:
-                    self._record_stream_usage(
-                        backend=backend,
-                        original_model=original_model,
-                        input_tokens=usage["input_tokens"],
-                        output_tokens=usage["output_tokens"],
-                        cache_creation_input_tokens=usage["cache_creation_input_tokens"],
-                        cache_read_input_tokens=usage["cache_read_input_tokens"],
-                        billing_mode=billing_mode,
-                        metadata=metadata,
-                    )
-                if dump_chunks is not None:
-                    self._dump_api_call(
-                        request_body, b"".join(dump_chunks) or None,
-                        original_model, backend["id"], elapsed_ms,
-                    )
-            return resp
-        else:
-            resp = web.StreamResponse()
+        resp = web.StreamResponse()
+        if not needs_translate:
+            # Translate rewrites the body into a different protocol, so upstream's own
+            # content headers would describe something the client is not receiving.
             _forward_upstream_headers(upstream.headers, resp.headers)
-            resp.content_type = "text/event-stream"
-            resp.headers["Cache-Control"] = "no-cache"
-            resp.headers["Connection"] = "keep-alive"
-            resp.headers["x-gateway-backend"] = backend["id"]
-            if fallback_header:
-                resp.headers["x-gateway-model-fallback"] = fallback_header
-            await resp.prepare(request)
+        resp.content_type = "text/event-stream"
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Connection"] = "keep-alive"
+        resp.headers["x-gateway-backend"] = backend["id"]
+        if fallback_header:
+            resp.headers["x-gateway-model-fallback"] = fallback_header
+        await resp.prepare(request)
 
-            try:
-                async for chunk in upstream.content.iter_any():
-                    if dump_chunks is not None:
-                        dump_chunks.append(chunk)
-                    await resp.write(chunk)
-            finally:
-                upstream.release()
+        async def _upstream_chunks():
+            async for chunk in upstream.content.iter_any():
+                parser.push_bytes(chunk)
+                yield chunk
+
+        try:
+            if needs_translate:
+                from .translate import openai_sse_to_anthropic_sse
+
+                stream = openai_sse_to_anthropic_sse(_upstream_chunks(), original_model)
+            else:
+                stream = _upstream_chunks()
+
+            async for chunk in stream:
                 if dump_chunks is not None:
-                    self._dump_api_call(
-                        request_body, b"".join(dump_chunks) or None,
-                        original_model, backend["id"], elapsed_ms,
-                    )
-            return resp
+                    dump_chunks.append(chunk)
+                await resp.write(chunk)
+        finally:
+            upstream.release()
+            if parser.has_usage():
+                await record_gateway_usage(
+                    backend=backend,
+                    usage=parser.usage,
+                    elapsed_ms=elapsed_ms,
+                    pricing=self.pricing,
+                    tracker=self.usage,
+                    billing_mode=billing_mode,
+                    default_billing_mode=self.config.mode,
+                    metadata=metadata,
+                )
+            if dump_chunks is not None:
+                self._dump_api_call(
+                    request_body, b"".join(dump_chunks) or None,
+                    original_model, backend["id"], elapsed_ms,
+                )
+        return resp
 
     # ------------------------------------------------------------------
     # Helpers
@@ -978,166 +976,6 @@ class GatewayServer:
             file_path.write_text(json.dumps(dump) + "\n", encoding="utf-8")
         except Exception:  # noqa: BLE001 — dump failure should never break the proxy
             logger.debug("Failed to dump API call", exc_info=True)
-
-    def _record_stream_usage(
-        self,
-        *,
-        backend: dict[str, Any],
-        original_model: str,
-        input_tokens: int,
-        output_tokens: int,
-        cache_creation_input_tokens: int = 0,
-        cache_read_input_tokens: int = 0,
-        billing_mode: str | None = None,
-        metadata: dict[str, str] | None = None,
-    ) -> None:
-        model = original_model or f"{self._infer_provider_from_backend(backend, original_model)}/unknown"
-        provider = self._infer_provider_from_backend(backend, model)
-        if cache_creation_input_tokens or cache_read_input_tokens:
-            cost = self.pricing.calculate_cost_with_cache(
-                provider,
-                model,
-                input_tokens,
-                output_tokens,
-                cache_creation_input_tokens,
-                cache_read_input_tokens,
-            )
-        else:
-            cost = self.pricing.calculate_cost(provider, model, input_tokens, output_tokens)
-        self.usage.record_usage(
-            provider=provider,
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_creation_input_tokens=cache_creation_input_tokens,
-            cache_read_input_tokens=cache_read_input_tokens,
-            latency_ms=0,
-            fallback=":fb:" in backend["id"],
-            cost=cost,
-            billing_mode=billing_mode or self.config.mode,
-            metadata=metadata,
-        )
-
-    def _record_usage_if_possible(
-        self,
-        *,
-        backend: dict[str, Any],
-        response_body: bytes,
-        original_model: str,
-        elapsed_ms: int,
-        billing_mode: str | None = None,
-        metadata: dict[str, str] | None = None,
-    ) -> None:
-        try:
-            payload = json.loads(response_body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return
-
-        model = original_model or payload.get("model") or ""
-        usage = payload.get("usage") or {}
-
-        input_tokens = self._as_int(
-            usage.get("input_tokens", usage.get("prompt_tokens", 0))
-        )
-        output_tokens = self._as_int(
-            usage.get("output_tokens", usage.get("completion_tokens", 0))
-        )
-        cache_creation_in = self._as_int(usage.get("cache_creation_input_tokens", 0))
-        cache_read_in = self._as_int(usage.get("cache_read_input_tokens", 0))
-
-        if not model and not input_tokens and not output_tokens:
-            return
-
-        provider = self._infer_provider_from_backend(backend, model)
-
-        if cache_creation_in or cache_read_in:
-            cost = self.pricing.calculate_cost_with_cache(
-                provider,
-                model or f"{provider}/unknown",
-                input_tokens,
-                output_tokens,
-                cache_creation_in,
-                cache_read_in,
-            )
-        else:
-            cost = self.pricing.calculate_cost(
-                provider,
-                model or f"{provider}/unknown",
-                input_tokens,
-                output_tokens,
-            )
-
-        self.usage.record_usage(
-            provider=provider,
-            model=model or f"{provider}/unknown",
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_creation_input_tokens=cache_creation_in,
-            cache_read_input_tokens=cache_read_in,
-            latency_ms=elapsed_ms,
-            fallback=":fb:" in backend["id"],
-            cost=cost,
-            billing_mode=billing_mode or self.config.mode,
-            metadata=metadata,
-        )
-
-    @staticmethod
-    def _extract_usage_from_sse(chunks: list[bytes]) -> dict[str, int] | None:
-        payload = b"".join(chunks).decode("utf-8", errors="ignore")
-        input_tokens = 0
-        output_tokens = 0
-        cache_creation_input_tokens = 0
-        cache_read_input_tokens = 0
-        found = False
-        for event in payload.split("\n\n"):
-            for line in event.splitlines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    parsed = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                usage = parsed.get("usage") or {}
-                if not usage:
-                    continue
-                input_tokens = GatewayServer._as_int(usage.get("prompt_tokens", usage.get("input_tokens", input_tokens)))
-                output_tokens = GatewayServer._as_int(usage.get("completion_tokens", usage.get("output_tokens", output_tokens)))
-                cache_creation_input_tokens = GatewayServer._as_int(usage.get("cache_creation_input_tokens", cache_creation_input_tokens))
-                cache_read_input_tokens = GatewayServer._as_int(usage.get("cache_read_input_tokens", cache_read_input_tokens))
-                found = True
-        if not found:
-            return None
-        return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_creation_input_tokens,
-            "cache_read_input_tokens": cache_read_input_tokens,
-        }
-
-    @staticmethod
-    def _infer_provider_from_backend(backend: dict[str, Any], model: str) -> str:
-        if "/" in model:
-            return model.split("/", 1)[0]
-        backend_id = backend.get("id", "")
-        if backend_id.startswith("anthropic"):
-            return "anthropic"
-        if backend_id.startswith("openai"):
-            return "openai"
-        if backend_id.startswith("google"):
-            return "google"
-        if backend_id.startswith("openrouter"):
-            return "openrouter"
-        return backend_id.split(":", 1)[0] or "unknown"
-
-    @staticmethod
-    def _as_int(value: Any) -> int:
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
 
     # ------------------------------------------------------------------
     # Info endpoints
